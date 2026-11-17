@@ -182,13 +182,26 @@ private:
                 }
                 int busy = 0;
                 for (const auto & j : active_) busy += j != nullptr;
-                for (size_t s = 0; s < active_.size() && !queue_.empty() && busy < limit_; ++s)
-                    if (!active_[s]) {
-                        ++busy;
-                        active_[s] = queue_.front();
-                        queue_.pop_front();
-                        admitted.push_back(active_[s]);
+                while (!queue_.empty() && busy < limit_) {
+                    // Route a continuing conversation to the free slot that owns
+                    // its longest cached prefix. Without this, requests arriving in
+                    // a different order silently lose all prompt-cache reuse.
+                    size_t chosen = active_.size();
+                    uint32_t best = 0;
+                    for (size_t s = 0; s < active_.size(); ++s) {
+                        if (active_[s]) continue;
+                        const uint32_t shared = model_.prompt_cache_affinity(int(s), queue_.front()->prompt);
+                        if (chosen == active_.size() || shared > best) {
+                            chosen = s;
+                            best = shared;
+                        }
                     }
+                    if (chosen == active_.size()) break;
+                    ++busy;
+                    active_[chosen] = queue_.front();
+                    queue_.pop_front();
+                    admitted.push_back(active_[chosen]);
+                }
             }
             for (size_t s = 0; s < active_.size(); ++s) {  // prefill newly admitted requests
                 auto & job = active_[s];

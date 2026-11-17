@@ -388,7 +388,7 @@ public:
             if (!opt.draft_model.empty() && gguf) load_dflash(opt.draft_model.c_str());
             memlog("drafter");
             calibrate_prefill();
-            pc_on = (opt.prompt_cache || kv_cmp) && slots == 1;
+            pc_on = opt.prompt_cache || kv_cmp;
             pc_step = opt.prompt_cache_step > 0 ? uint32_t(opt.prompt_cache_step)
                       : (opt.prompt_cache_step == 0 ? 0u : 2048u);   // -1: auto
             pc_probe = opt.prompt_cache_probe > 0 ? uint32_t(opt.prompt_cache_probe) : 0u;
@@ -763,9 +763,9 @@ private:
     int cmp_layer = -1, ring_used = 0, ring_end = 0;  // the ring is written at position % kRing; newest row before ring_end
     std::vector<int> cmp_r;  // per attention layer; the middle ones lose most to compaction and keep twice the rows
     int64_t cmp_pos = 0, cmp_max = 0;  // cmp_max: positions the stand-in buffers can cover
-    // Prompt reuse (one slot): the cache holds pc_seq. With pc_live the recurrent state is at pc_seq.size(); pc_host
-    // holds the state at pc_snap, a prefill chunk boundary kTail tokens before the last prompt's end, for a prompt that
-    // shares only that much (a chat template re-renders the previous answer without its think tags).
+    // Prompt reuse (per slot): select_slot swaps cache metadata and pinned snapshots alongside KV/GDN state.
+    // pc_host holds the recurrent state at pc_snap, a prefill chunk boundary kTail tokens before the
+    // previous prompt's end, for a new prompt that shares only that much (the chat template may drop think tags).
     static constexpr uint32_t kTail = 64;
     // State snapshots at --prompt-cache-step spacing, so a mid-history divergence has somewhere to resume. Each holds
     // only the recurrent/conv state (the per-position KV of the full-attention layers is already in the pool and needs
@@ -1909,6 +1909,15 @@ private:
         Sampling samp;
         std::mt19937_64 rng{0};
         Gen gen;
+        // Each slot owns its own prompt history and recurrent-state checkpoints.
+        // KV pages already belong to kv_seq, so sharing this bookkeeping across
+        // slots would restore the wrong GDN state when requests interleave.
+        std::vector<PcCk> pc_cks;
+        std::vector<std::unique_ptr<HostBuf>> pc_pool;
+        std::vector<uint32_t> pc_seq;
+        std::unique_ptr<HostBuf> pc_host;
+        uint32_t pc_snap = 0, pc_next = 0, last_pc = 0;
+        bool pc_live = false, pc_protect = false;
     };
     std::vector<SeqState> parked;  // parked[s] holds slot s while it is not active
     int active = 0, nslots = 1, NB = NVER;
@@ -1945,6 +1954,15 @@ private:
         std::swap(samp, s.samp);
         std::swap(rng, s.rng);
         std::swap(gen, s.gen);
+        std::swap(pc_cks, s.pc_cks);
+        std::swap(pc_pool, s.pc_pool);
+        std::swap(pc_seq, s.pc_seq);
+        std::swap(pc_host, s.pc_host);
+        std::swap(pc_snap, s.pc_snap);
+        std::swap(pc_next, s.pc_next);
+        std::swap(last_pc, s.last_pc);
+        std::swap(pc_live, s.pc_live);
+        std::swap(pc_protect, s.pc_protect);
     }
     std::mt19937_64 rng{0};
     Buf s_id, s_lg, s_scr;
@@ -4768,6 +4786,11 @@ public:
     }
     std::vector<uint32_t> spec_finish(uint64_t * stats) override { return dflash_finish(stats); }
     uint32_t cached_prefix() const override { return last_pc; }
+    uint32_t prompt_cache_affinity(int slot, const std::vector<uint32_t> & prompt) const override {
+        if (!pc_on || slot < 0 || slot >= nslots) return 0;
+        const auto & seq = slot == active ? pc_seq : parked[size_t(slot)].pc_seq;
+        return common_prefix(seq, prompt);
+    }
     uint32_t prefill_progress() const override { return pf_progress_done(); }
     std::vector<uint32_t> spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) override {

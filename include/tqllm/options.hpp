@@ -19,8 +19,8 @@ struct EngineOptions {
                                    // queries (the question), at the cost of that time before the first token
     int prefill_int8 = -1;  // --prefill-int8 on|off: prefill GEMMs in int8 (per-row x per-token scales) default on RTX 30 / 40 / 50, opt-in elsewhere (sm_80+)
     int prefill_fp8 = -1;  // --prefill-fp8 on|off: prefill GEMMs in FP8 (E4M3, per-row x per-token scales); default on GB10 (validated), opt-in on other sm_89+ GPUs
-    bool prompt_cache = false;  // --prompt-cache on|off: one slot keeps the previous request's cache and prefills only the
-                                // part of a new prompt past the shared prefix (on with --kv-compact)
+    bool prompt_cache = false;  // --prompt-cache on|off: each slot retains its conversation and reuses the
+                                // shared token prefix on the next request (on with --kv-compact)
     int prompt_cache_step = -1;  // --prompt-cache-step N: keep a recurrent-state snapshot every N prompt tokens, so a
                                  // new prompt that diverges mid-history resumes from the last snapshot before the
                                  // divergence instead of re-prefilling everything. -1: auto (2048 tokens, widened so the

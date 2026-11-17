@@ -58,6 +58,9 @@ struct Engine {
     virtual std::vector<uint32_t> spec_finish(uint64_t *) { return {}; }
     // prompt tokens the last request reused from the prompt cache instead of prefilling them
     virtual uint32_t cached_prefix() const { return 0; }
+    // Affinity hint for choosing an idle slot: longest common token prefix of its
+    // retained prompt, not a cache hit claim (checkpoint depth is checked later).
+    virtual uint32_t prompt_cache_affinity(int, const std::vector<uint32_t> &) const { return 0; }
     // prompt tokens of the running prefill the GPU has finished (0 when the engine does not track it)
     virtual uint32_t prefill_progress() const { return 0; }
     virtual std::vector<uint32_t> spec_tokens(int) const { return {}; }  // slot's ids so far (streaming)

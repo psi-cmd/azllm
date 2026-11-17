@@ -692,6 +692,9 @@ void Model::spec_step(const std::vector<int> & slots, std::vector<char> & done) 
 }
 std::vector<uint32_t> Model::spec_finish(uint64_t * stats) { return impl_->e->spec_finish(stats); }
 uint32_t Model::cached_prefix() const { return impl_->e->cached_prefix(); }
+uint32_t Model::prompt_cache_affinity(int slot, const std::vector<uint32_t> & prompt) const {
+    return impl_->e->prompt_cache_affinity(slot, prompt);
+}
 uint32_t Model::prefill_progress() const { return impl_->e->prefill_progress(); }
 std::vector<uint32_t> Model::spec_tokens(int slot) const { return impl_->e->spec_tokens(slot); }
 int Model::drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) {

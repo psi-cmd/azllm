@@ -281,8 +281,8 @@ int main(int argc, char ** argv) {
         minfo.kv_store = engine.kv_store;
         minfo.draft = engine.draft_model;
         minfo.prompt_cache = engine.prompt_cache ? "on" : "off";
-        // prefix reuse needs a single slot: --np > 1 costs a client every prefix hit, silently
-        minfo.cache_active = ((engine.prompt_cache || engine.kv_compact > 0) && np == 1) ? "on" : "off";
+        // Per-slot prompt caches stay active when --np > 1; scheduler routes by prefix affinity.
+        minfo.cache_active = (engine.prompt_cache || engine.kv_compact > 0) ? "on" : "off";
         minfo.reasoning = reasoning ? "on" : "off";
         minfo.effort = reasoning ? effort : "off";
         const std::string models_body = tqserve::models_json(minfo);
