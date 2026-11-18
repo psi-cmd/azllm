@@ -62,10 +62,10 @@ __global__ void tq3_quantize_k(const float * x, uint4 * out, int64_t nblocks) {
     word |= __shfl_xor_sync(0xffffffffu, word, 2);
     word |= __shfl_xor_sync(0xffffffffu, word, 4);
     const uint32_t sb = encode_e3m5(scale) << (8 * g);
-    const uint32_t g0 = __shfl_sync(0xffffffffu, word, 0), g1 = __shfl_sync(0xffffffffu, word, 8);
-    const uint32_t g2 = __shfl_sync(0xffffffffu, word, 16), g3 = __shfl_sync(0xffffffffu, word, 24);
-    const uint32_t scales = __shfl_sync(0xffffffffu, sb, 0) | __shfl_sync(0xffffffffu, sb, 8) |
-                            __shfl_sync(0xffffffffu, sb, 16) | __shfl_sync(0xffffffffu, sb, 24);
+    const uint32_t g0 = __shfl_sync(0xffffffffu, word, 0, 32), g1 = __shfl_sync(0xffffffffu, word, 8, 32);
+    const uint32_t g2 = __shfl_sync(0xffffffffu, word, 16, 32), g3 = __shfl_sync(0xffffffffu, word, 24, 32);
+    const uint32_t scales = __shfl_sync(0xffffffffu, sb, 0, 32) | __shfl_sync(0xffffffffu, sb, 8, 32) |
+                            __shfl_sync(0xffffffffu, sb, 16, 32) | __shfl_sync(0xffffffffu, sb, 24, 32);
     if (lane == 0) out[b] = make_uint4(scales, g0 | (g1 << 24), (g1 >> 8) | (g2 << 16), (g2 >> 16) | (g3 << 8));
 }
 

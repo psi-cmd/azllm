@@ -145,6 +145,16 @@ __global__ void gated_rms_k(const __nv_bfloat16 * x, const __nv_bfloat16 * z, co
 }
 
 
+__device__ __forceinline__ __nv_bfloat16 conv4_silu(float w0, float w1, float w2, float w3,
+                                                    __nv_bfloat16 s0, __nv_bfloat16 s1, __nv_bfloat16 s2,
+                                                    __nv_bfloat16 xc) {
+    const float acc = __fmaf_rn(w3, __bfloat162float(xc),
+                      __fmaf_rn(w2, __bfloat162float(s2),
+                      __fmaf_rn(w1, __bfloat162float(s1), w0 * __bfloat162float(s0))));
+    const float conv = __bfloat162float(__float2bfloat16_rn(acc));
+    return __float2bfloat16_rn(conv / (1.f + expf(-conv)));
+}
+
 __global__ void conv_multi_k(const __nv_bfloat16 * xin, int xs_, int n, const __nv_bfloat16 * sin, __nv_bfloat16 * sout,
                              const float * w, __nv_bfloat16 * y, int C, const int * par = nullptr,
                              const tqllm_cuda::ConvReplay rp = {}) {
@@ -161,10 +171,7 @@ __global__ void conv_multi_k(const __nv_bfloat16 * xin, int xs_, int n, const __
         const int pend = rp.pend ? *rp.pend : 0;
         for (int r = 0; r < pend; ++r) {  // deferred commit: the previous step's accepted path, as a chain
             const __nv_bfloat16 xc = rp.x[int64_t(r) * xs_ + c];
-            const float acc = w0 * __bfloat162float(hs[0]) + w1 * __bfloat162float(hs[1]) + w2 * __bfloat162float(hs[2]) +
-                              w3 * __bfloat162float(xc);
-            const float conv = __bfloat162float(__float2bfloat16_rn(acc));
-            rp.y[int64_t(r) * C + c] = __float2bfloat16_rn(conv / (1.f + expf(-conv)));
+            rp.y[int64_t(r) * C + c] = conv4_silu(w0, w1, w2, w3, hs[0], hs[1], hs[2], xc);
             hs[0] = hs[1], hs[1] = hs[2], hs[2] = xc;
         }
         if (pend) rp.smid[c] = hs[0], rp.smid[C + c] = hs[1], rp.smid[2 * C + c] = hs[2];
@@ -174,10 +181,7 @@ __global__ void conv_multi_k(const __nv_bfloat16 * xin, int xs_, int n, const __
             int a = spar[i], m = 0;  // v[0] = nearest ancestor input
             for (; m < 3 && a >= 0; ++m, a = spar[a]) v[m] = xs[a];
             for (int st = 2; m < 3; ++m, --st) v[m] = hs[st];  // then s2, s1, s0 of the state (after the replay)
-            const float acc = w0 * __bfloat162float(v[2]) + w1 * __bfloat162float(v[1]) + w2 * __bfloat162float(v[0]) +
-                              w3 * __bfloat162float(xc);
-            const float conv = __bfloat162float(__float2bfloat16_rn(acc));
-            y[int64_t(i) * C + c] = __float2bfloat16_rn(conv / (1.f + expf(-conv)));
+            y[int64_t(i) * C + c] = conv4_silu(w0, w1, w2, w3, v[2], v[1], v[0], xc);
             if (i == n - 1 && !rp.smid) {  // state after the last node (a chain's final state)
                 sout[c] = v[1];
                 sout[C + c] = v[0];
@@ -191,10 +195,7 @@ __global__ void conv_multi_k(const __nv_bfloat16 * xin, int xs_, int n, const __
     const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
     for (int i = 0; i < n; ++i) {
         const __nv_bfloat16 xc = xin[int64_t(i) * xs_ + c];
-        const float acc = w0 * __bfloat162float(s0) + w1 * __bfloat162float(s1) + w2 * __bfloat162float(s2) +
-                          w3 * __bfloat162float(xc);
-        const float conv = __bfloat162float(__float2bfloat16_rn(acc));
-        y[int64_t(i) * C + c] = __float2bfloat16_rn(conv / (1.f + expf(-conv)));
+        y[int64_t(i) * C + c] = conv4_silu(w0, w1, w2, w3, s0, s1, s2, xc);
         s0 = s1;
         s1 = s2;
         s2 = xc;
@@ -217,10 +218,7 @@ __global__ void conv_long_k(const __nv_bfloat16 * xin, int xs_, int n, const __n
     const int i1 = min(n, i0 + CONV_RUN);
     for (int i = i0; i < i1; ++i) {
         const __nv_bfloat16 xc = xin[int64_t(i) * xs_ + c];
-        const float acc = w0 * __bfloat162float(s0) + w1 * __bfloat162float(s1) + w2 * __bfloat162float(s2) +
-                          w3 * __bfloat162float(xc);
-        const float conv = __bfloat162float(__float2bfloat16_rn(acc));
-        y[int64_t(i) * C + c] = __float2bfloat16_rn(conv / (1.f + expf(-conv)));
+        y[int64_t(i) * C + c] = conv4_silu(w0, w1, w2, w3, s0, s1, s2, xc);
         s0 = s1;
         s1 = s2;
         s2 = xc;

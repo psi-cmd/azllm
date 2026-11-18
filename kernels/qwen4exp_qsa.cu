@@ -33,7 +33,7 @@ __global__ void score_blocks(const float * pooled_keys, const float * query, flo
         for (int d = lane; d < dim; d += 32)
             dot = fmaf(pooled_keys[int64_t(block) * dim + d], query[int64_t(h) * dim + d], dot);
         for (int delta = 16; delta; delta >>= 1)
-            dot += __shfl_down_sync(0xffffffffu, dot, delta);
+            dot += __shfl_down_sync(0xffffffffu, dot, delta, 32);
         if (lane == 0) total += fmaxf(dot, 0.f);
     }
     if (lane == 0) scores[block] = total;
@@ -125,7 +125,7 @@ __global__ void attention_selected(const float * query, const __nv_bfloat16 * ke
         if (valid[row])
             for (int d = lane; d < dim; d += 32)
                 dot = fmaf(q[d], __bfloat162float(keys[(int64_t(row) * kv_heads + kv_head) * dim + d]), dot);
-        for (int delta = 16; delta; delta >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, delta);
+        for (int delta = 16; delta; delta >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, delta, 32);
         if (lane == 0) scores[row] = valid[row] ? dot * rsqrtf(float(dim)) : -INFINITY;
     }
     __syncthreads();
@@ -181,7 +181,7 @@ __global__ void score_pack_batch(const float * pooled_keys, const float * query,
         for (int d = lane; d < dim; d += 32)
             dot = fmaf(pooled_keys[int64_t(block) * dim + d], q[int64_t(h) * dim + d], dot);
         for (int delta = 16; delta; delta >>= 1)
-            dot += __shfl_down_sync(0xffffffffu, dot, delta);
+            dot += __shfl_down_sync(0xffffffffu, dot, delta, 32);
         if (lane == 0) total += fmaxf(dot, 0.f);
     }
     if (lane == 0) {
@@ -234,7 +234,7 @@ __global__ void score_pack_fixed_k(const float * pooled_keys, const float * quer
     }
     const float dot = a[0] + __shfl_xor_sync(0xffffffffu, a[0], 1);
     // heads 1..3 of this lane's block sit 2, 4, 6 lanes up; the total adds them in head order as score_pack_batch does
-    const float d1 = __shfl_down_sync(0xffffffffu, dot, 2), d2 = __shfl_down_sync(0xffffffffu, dot, 4), d3 = __shfl_down_sync(0xffffffffu, dot, 6);
+    const float d1 = __shfl_down_sync(0xffffffffu, dot, 2, 32), d2 = __shfl_down_sync(0xffffffffu, dot, 4, 32), d3 = __shfl_down_sync(0xffffffffu, dot, 6, 32);
     if ((lane & 7) == 0) {
         const int b = ((lane >> 4) << 1) | ((lane >> 3) & 1), block = block0 + b;
         if (block >= blocks) return;
@@ -294,7 +294,7 @@ __global__ void attention_direct(const float * query, const __nv_bfloat16 * keys
         if (cell[row] >= 0)
             for (int d = lane; d < dim; d += 32)
                 dot = fmaf(q[d], __bfloat162float(keys[(int64_t(cell[row]) * kv_heads + kv_head) * dim + d]), dot);
-        for (int delta = 16; delta; delta >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, delta);
+        for (int delta = 16; delta; delta >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, delta, 32);
         if (lane == 0) scores[row] = valid[row] ? dot * rsqrtf(float(dim)) : -INFINITY;
     }
     __syncthreads();
@@ -362,7 +362,7 @@ __global__ void grouped_scores_k(const float * query, const __nv_bfloat16 * keys
         for (int g = 0; g < kQsaMaxGroup; ++g) {
             if (g >= group) break;
             float v = dot[g];
-            for (int delta = 16; delta; delta >>= 1) v += __shfl_down_sync(0xffffffffu, v, delta);
+            for (int delta = 16; delta; delta >>= 1) v += __shfl_down_sync(0xffffffffu, v, delta, 32);
             if (lane == 0)
                 scores[(int64_t(t) * heads + kv_head * group + g) * width + row] = valid[row] ? v * rsqrtf(float(dim)) : -INFINITY;
         }

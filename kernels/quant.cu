@@ -79,13 +79,13 @@ __global__ void tq3_matvec_f32_raw_k(const uint4 * weights, const float * xr, fl
             sum += e3m5((q.x >> (8 * g)) & 255) * part;
         }
     }
-    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
     __shared__ float partial[8];
     if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = sum;
     __syncthreads();
     if (threadIdx.x < 32) {
         sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.f;
-        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
         if (threadIdx.x == 0) y[int64_t(token) * rows + row] = sum;
     }
 }
@@ -447,34 +447,56 @@ __global__ void norm_rotate_h_k(const __nv_bfloat16 * x, const float * w, const 
     xh[o] = __float2half_rn(wht32(v * TQ3_SIGNS[lane], lane));
 }
 
+#include "bw_primitives.cuh"
+
 __device__ __forceinline__ void mma_f16(float * c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 __device__ __forceinline__ void mma_f16h(uint32_t * c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {  // FP16 accumulate: twice the GA10x tensor rate
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16acc(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c[0]), "+r"(c[1])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 __device__ __forceinline__ uint32_t hmul2u(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hmul2u(a, b);
+#else
     uint32_t r;
     asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
     return r;
+#endif
 }
 __device__ __forceinline__ uint32_t hadd2u(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hadd2u(a, b);
+#else
     uint32_t r;
     asm("add.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
     return r;
+#endif
 }
 
 __device__ __forceinline__ uint32_t hfma2u(uint32_t a, uint32_t b, uint32_t c) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hfma2u(a, b, c);
+#else
     uint32_t r;
     asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
+#endif
 }
 
 // FP16 tensor-core matvec over the repacked TQ3_4S layout. CTA = 8 warps on one 16-row tile, split-K across warps.

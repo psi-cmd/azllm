@@ -166,7 +166,9 @@ struct Qwen2Engine final : Engine {
             eos_ = tokenizer.eos_id();
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
+#ifndef TQLLM_BW
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
+#endif
             load_weights(path);
             resolve_weights();
             allocate();

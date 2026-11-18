@@ -20,13 +20,13 @@ template<class Input> __global__ void router_k(const float * w, const float * sh
     const Input * xr = x + int64_t(token) * h;
     float sum = 0.f;
     for (int j = threadIdx.x; j < h; j += blockDim.x) sum += wr[j] * router_value(xr[j]);
-    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
     __shared__ float partial[8];
     if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = sum;
     __syncthreads();
     if (threadIdx.x < 32) {
         sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.f;
-        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
         if (threadIdx.x == 0) logits[int64_t(token) * (e + 1) + row] = sum;
     }
 }
@@ -56,7 +56,7 @@ __global__ void topk_k(const float * logits, int * ids, float * weights, float *
     for (int d = 128; d >= 32; d >>= 1) { if (tid < d) reduce[tid] += reduce[tid + d]; __syncthreads(); }
     if (warp == 0) {
         sum = reduce[tid];
-        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
         if (!lane) reduce[0] = sum;
     }
     __syncthreads();
@@ -69,7 +69,7 @@ __global__ void topk_k(const float * logits, int * ids, float * weights, float *
         for (int j = tid; j < e; j += blockDim.x)
             if (probs[j] > value || (probs[j] == value && j < best)) { value = probs[j]; best = j; }
         for (int d = 16; d; d >>= 1) {
-            const float v = __shfl_down_sync(0xffffffffu, value, d); const int b = __shfl_down_sync(0xffffffffu, best, d);
+            const float v = __shfl_down_sync(0xffffffffu, value, d, 32); const int b = __shfl_down_sync(0xffffffffu, best, d, 32);
             if (v > value || (v == value && b < best)) { value = v; best = b; }
         }
         if (!lane) { reduce[warp] = value; indices[warp] = best; }
@@ -118,8 +118,8 @@ __global__ void topk_warp_k(const float * logits, int * ids, float * weights, fl
 #pragma unroll
     for (int q = 0; q < 2; ++q) s[q] += s[q + 2];
     float sum = s[0] + s[1];
-    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
-    sum = __shfl_sync(0xffffffffu, sum, 0);
+    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
+    sum = __shfl_sync(0xffffffffu, sum, 0, 32);
 #pragma unroll
     for (int q = 0; q < 8; ++q)
 #pragma unroll

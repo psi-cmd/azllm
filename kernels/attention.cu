@@ -2,6 +2,7 @@
 // Pass 1: block (kv_head, split) stages one chunk of K/V in shared memory once and serves every query head of the
 // GQA group, writing an unnormalised partial output plus its max and sum. Pass 2 merges the splits.
 #include <cuda_fp16.h>
+#include "bw_dumma.cuh"
 #include "common.cuh"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
@@ -373,9 +374,13 @@ __global__ void turbo3_inverse_multi_k(__nv_bfloat16 * data, int heads, int dim)
 
 __device__ __forceinline__ void mma_bf16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                          uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_bf16(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ uint32_t pack_bf16(float x, float y) {
@@ -389,7 +394,32 @@ __device__ __forceinline__ uint32_t pack_bf16(__nv_bfloat16 x, __nv_bfloat16 y) 
 }
 
 __device__ __forceinline__ void cp_async16(void * dst, const void * src) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::cp_async16(dst, src);
+#else
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(uint32_t(__cvta_generic_to_shared(dst))), "l"(src));
+#endif
+}
+
+__device__ __forceinline__ void cp_async4(void * dst, const void * src) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::cp_async4(dst, src);
+#else
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(uint32_t(__cvta_generic_to_shared(dst))), "l"(src));
+#endif
+}
+
+__device__ __forceinline__ void cp_commit() {
+#if !TQLLM_USE_BW_PRIMITIVES
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+template <int N>
+__device__ __forceinline__ void cp_wait() {
+#if !TQLLM_USE_BW_PRIMITIVES
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
 }
 
 // Block = 8 warps (DIM == 256), rows = nq * group <= 48 (3 m-tiles). BF16 tensor cores (m16n8k16), work balanced
@@ -464,7 +494,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
                 cp_async16(kss + (buf * MQ_TILE + t) * (DIM / 32), ksc + si);
                 if constexpr (Q8V) cp_async16(vss + (buf * MQ_TILE + t) * (DIM / 32), vsc + si);
             }
-            asm volatile("cp.async.commit_group;\n" ::);
+            cp_commit();
             return;
         }
         for (int i = t; i < MQ_TILE * (DIM / 8); i += blockDim.x) {
@@ -479,7 +509,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
                 *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
             }
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        cp_commit();
     };
     if (beg < end) stage(0, beg);
 
@@ -507,9 +537,9 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
         const int n = min(MQ_TILE, end - t0);
         if (t0 + stride < end) {
             stage(buf ^ 1, t0 + stride);
-            asm volatile("cp.async.wait_group 1;\n" ::);
+            cp_wait<1>();
         } else {
-            asm volatile("cp.async.wait_group 0;\n" ::);
+            cp_wait<0>();
         }
         __syncthreads();
         if constexpr (Q8) {  // int8 x per-32 scale -> BF16 tiles (zero tail rows: 0 * stale NaN in the MMA)
@@ -542,9 +572,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
 #pragma unroll
             for (int kk = 0; kk < DIM / 16; kk += 2) {
                 uint32_t b[4];  // keys nt*8 .. +7, dims kk*16 .. kk*16+31
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3])
-                             : "r"(sh(ks + (nt * 8 + lane % 8) * KS + kk * 16 + (lane / 8) * 8)));
+                tqllm_dev::ldsm_x4(b, ks + (nt * 8 + lane % 8) * KS + kk * 16 + (lane / 8) * 8);
 #pragma unroll
                 for (int mm = 0; mm < 2; ++mm) {
                     if (mm >= m_n || m_lo + mm >= mt) break;
@@ -552,9 +580,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
 #pragma unroll
                     for (int h = 0; h < 2; ++h) {
                         uint32_t a[4];
-                        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                                     : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
-                                     : "r"(sh(qs + (m * 16 + lane % 16) * KS + (kk + h) * 16 + (lane / 16) * 8)));
+                        tqllm_dev::ldsm_x4(a, qs + (m * 16 + lane % 16) * KS + (kk + h) * 16 + (lane / 16) * 8);
                         mma_bf16(c[mm], a[0], a[1], a[2], a[3], b[2 * h], b[2 * h + 1]);
                     }
                 }
@@ -615,9 +641,7 @@ __global__ void __launch_bounds__(DIM) attn_mq_k(const __nv_bfloat16 * q, const 
             uint32_t b[2][4];  // ldmatrix.trans: V[key][dim] -> B fragments of n-tiles (0,1) and (2,3)
 #pragma unroll
             for (int jp = 0; jp < 2; ++jp)
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(b[jp][0]), "=r"(b[jp][1]), "=r"(b[jp][2]), "=r"(b[jp][3])
-                             : "r"(sh(vs + (kk * 16 + lane % 16) * KS + d0 + jp * 16 + (lane / 16) * 8)));
+                tqllm_dev::ldsm_x4_t(b[jp], vs + (kk * 16 + lane % 16) * KS + d0 + jp * 16 + (lane / 16) * 8);
             const int p = kk * 16 + tig * 2;
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
@@ -756,15 +780,23 @@ __device__ __forceinline__ uint32_t t4k_expand(uint32_t c) {
 }
 
 __device__ __forceinline__ uint32_t hmul2_u(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hmul2u(a, b);
+#else
     uint32_t d;
     asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
     return d;
+#endif
 }
 
 __device__ __forceinline__ uint32_t hadd2_u(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hadd2u(a, b);
+#else
     uint32_t d;
     asm("add.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
     return d;
+#endif
 }
 
 __device__ __forceinline__ uint32_t pack_h2(float x, float y) {
@@ -774,16 +806,24 @@ __device__ __forceinline__ uint32_t pack_h2(float x, float y) {
 
 __device__ __forceinline__ void mma_f16acc(uint32_t (&c)[2], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                            uint32_t b0, uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16acc(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c[0]), "+r"(c[1])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                        uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_s8(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // T4K: Turbo4 K (Q rotated per 128 by the same transform, int8 per (row, 128); scores rescaled twice per head)
@@ -818,10 +858,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
         if constexpr (T4K) {
             for (int i = t; i < TILE * (K4B / 4); i += blockDim.x) {
                 const int p = i / (K4B / 4), w = i % (K4B / 4);
-                if (p < n)
-                    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(
-                                     uint32_t(__cvta_generic_to_shared(k8 + (buf * TILE + p) * K4B + w * 4))),
-                                 "l"(k4g + (int64_t(t0 + p) * kvheads + kh) * K4B + w * 4));
+                if (p < n) cp_async4(k8 + (buf * TILE + p) * K4B + w * 4, k4g + (int64_t(t0 + p) * kvheads + kh) * K4B + w * 4);
             }
         } else {
             for (int i = t; i < TILE * (DIM / 16); i += blockDim.x) {
@@ -835,13 +872,10 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
         const int n = min(TILE, end - t0);
         for (int i = t; i < TILE * (VB / 4); i += blockDim.x) {
             const int p = i / (VB / 4), w = i % (VB / 4);
-            if (p < n)
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(
-                                 uint32_t(__cvta_generic_to_shared(v3s + (buf * TILE + p) * VB + w * 4))),
-                             "l"(v3 + (int64_t(t0 + p) * kvheads + kh) * VB + w * 4));
+            if (p < n) cp_async4(v3s + (buf * TILE + p) * VB + w * 4, v3 + (int64_t(t0 + p) * kvheads + kh) * VB + w * 4);
         }
     };
-    auto commit = [] { asm volatile("cp.async.commit_group;\n" ::); };
+    auto commit = [] { cp_commit(); };
     const int ntile = beg < end ? (end - beg + stride - 1) / stride : 0;
     for (int u = 0; u < 2 && u < ntile; ++u) {
         stage_k(u, beg + u * stride);
@@ -1123,7 +1157,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
             }
     };
     if (ntile > 0) {
-        asm volatile("cp.async.wait_group 0;\n" ::);
+        cp_wait<0>();
         __syncthreads();
         qk_tile(0, beg, scb);
         __syncthreads();
@@ -1140,7 +1174,7 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
         if (u + 2 < ntile) stage_v(cur, beg + (u + 2) * stride);
         commit();
         if (u + 1 < ntile) softmax_tile(scb + nxt * MAXR * SCS);
-        asm volatile("cp.async.wait_group 1;\n" ::);  // K(u + 2) landed; V(u + 2) may still be in flight
+        cp_wait<1>();  // K(u + 2) landed; V(u + 2) may still be in flight
         __syncthreads();
     }
     auto out = [&](int r) { return part + ((int64_t(r / g) * heads + kh * g + r % g) * nsplit + split) * (DIM + 2); };
@@ -1164,18 +1198,17 @@ __global__ void __launch_bounds__(256, 2) attn_ctv_k(const __nv_bfloat16 * q, co
 // in the rotated basis), double-buffered, one barrier per tile. Each warp keeps S, P and O for its 16 rows in registers.
 namespace fap {
 constexpr int NW = 8, ROWS = NW * 16, TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8;
+constexpr int NB = TQLLM_USE_BW_PRIMITIVES ? 1 : 2;  // BW (gfx936): single-buffered -> 60.25 KB <= 64 KB LDS limit
 constexpr size_t smem() {
-    return size_t(ROWS) * QS + 2 * size_t(TILE) * KS + 2 * size_t(TILE) * VS * 2 + 2 * 2 * TILE * 4 + ROWS * 2 * 4;
+    return size_t(ROWS) * QS + NB * size_t(TILE) * KS + NB * size_t(TILE) * VS * 2 + NB * 2 * TILE * 4 + ROWS * 2 * 4;
 }
 }
 
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void * p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
+    tqllm_dev::ldsm_x4(r, p);
 }
 __device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void * p) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
+    tqllm_dev::ldsm_x4_t(r, p);
 }
 
 __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __nv_bfloat16 * q, const uint8_t * kc,
@@ -1186,10 +1219,10 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
     constexpr int RB = ctv::K4B;  // 132-byte Turbo4 record
     extern __shared__ __align__(16) unsigned char smem_raw[];
     int8_t * q8 = reinterpret_cast<int8_t *>(smem_raw);            // [ROWS][QS]
-    int8_t * k8 = q8 + ROWS * QS;                                   // [2][TILE][KS]
-    __half * vh = reinterpret_cast<__half *>(k8 + 2 * TILE * KS);   // [2][TILE][VS]
-    float * ksf = reinterpret_cast<float *>(vh + 2 * TILE * VS);    // [2][2 halves][TILE]
-    float * qsc = ksf + 2 * 2 * TILE;                               // [ROWS][2]
+    int8_t * k8 = q8 + ROWS * QS;                                   // [NB][TILE][KS]
+    __half * vh = reinterpret_cast<__half *>(k8 + NB * TILE * KS);  // [NB][TILE][VS]
+    float * ksf = reinterpret_cast<float *>(vh + NB * TILE * VS);   // [NB][2 halves][TILE]
+    float * qsc = ksf + NB * 2 * TILE;                              // [ROWS][2]
     const int kh = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32, gid = lane / 4, tig = lane % 4;
     const int g = heads / kvheads, rows = nq * g;
     const int r0 = (gridDim.y - 1 - blockIdx.y) * ROWS;  // longest (latest) row blocks first
@@ -1305,7 +1338,7 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
     const int8_t * qrow = q8 + (warp * 16 + (lane % 8) + ((lane / 8) & 1) * 8) * QS + (lane / 16) * 16;
 
     for (int u = 0; u < ntile; ++u) {
-        const int buf = u & 1, t0 = u * TILE;
+        const int buf = NB == 2 ? (u & 1) : 0, t0 = u * TILE;
         const int8_t * kt = k8 + buf * TILE * KS;
         const __half * vt = vh + buf * TILE * VS;
         float s[4][4];
@@ -1368,7 +1401,7 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
             pf[nt / 2][(nt & 1) * 2 + 1] = pack_h2(p2, p3);
         }
         l_a = l_a * al + sa, l_b = l_b * bl + sb;
-        if (__any_sync(0xffffffffu, al != 1.f || bl != 1.f))
+        if (tqllm_bw::any_sync32(0xffffffffu, al != 1.f || bl != 1.f))
 #pragma unroll
             for (int j = 0; j < 32; ++j) o[j][0] *= al, o[j][1] *= al, o[j][2] *= bl, o[j][3] *= bl;
         const __half * vrow = vt + ((lane / 8) & 1) * 8 * VS + (lane % 8) * VS + (lane / 16) * 8;
@@ -1389,7 +1422,12 @@ __global__ void __launch_bounds__(fap::NW * 32, 1) attn_t4kv_prefill_k(const __n
                 o[2 * np + n][0] += lo.x, o[2 * np + n][1] += lo.y, o[2 * np + n][2] += hi.x, o[2 * np + n][3] += hi.y;
             }
         }
-        if (u + 1 < ntile) store(buf ^ 1);
+        if constexpr (NB == 2) {
+            if (u + 1 < ntile) store(buf ^ 1);
+        } else if (u + 1 < ntile) {
+            __syncthreads();
+            store(0);
+        }
         if (u + 2 < ntile) load(t0 + 2 * TILE);
         __syncthreads();
     }
@@ -1444,7 +1482,7 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
                 *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
             }
         }
-        asm volatile("cp.async.commit_group;\n" ::);
+        cp_commit();
     };
     if (ntile > 0) stage(0, 0);
     if (ntile > 1) stage(1, TILE);
@@ -1465,8 +1503,8 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
 
     for (int u = 0; u < ntile; ++u) {
         const int buf = u & 1, t0 = u * TILE;
-        if (u + 1 < ntile) asm volatile("cp.async.wait_group 1;\n" ::);
-        else asm volatile("cp.async.wait_group 0;\n" ::);
+        if (u + 1 < ntile) cp_wait<1>();
+        else cp_wait<0>();
         __syncthreads();
         const __nv_bfloat16 * kt = ks + buf * TILE * LS;
         const __nv_bfloat16 * vt = vs + buf * TILE * LS;
@@ -1516,7 +1554,7 @@ __global__ void __launch_bounds__(fab::NW * 32, 1) attn_bf16_prefill_k(const __n
             pf[nt / 2][(nt & 1) * 2 + 1] = pack_bf16(p2, p3);
         }
         l_a = l_a * al + sa, l_b = l_b * bl + sb;
-        if (__any_sync(0xffffffffu, al != 1.f || bl != 1.f))
+        if (tqllm_bw::any_sync32(0xffffffffu, al != 1.f || bl != 1.f))
 #pragma unroll
             for (int j = 0; j < 32; ++j) o[j][0] *= al, o[j][1] *= al, o[j][2] *= bl, o[j][3] *= bl;
         const __nv_bfloat16 * vrow = vt + ((lane / 8) & 1) * 8 * LS + (lane % 8) * LS + (lane / 16) * 8;
@@ -1616,6 +1654,348 @@ __global__ void __launch_bounds__(DIM) attn_blk_k(const __nv_bfloat16 * q, const
     y[(int64_t(z) * heads + h) * DIM + d] = __float2bfloat16_rn(acc / zz);
 }
 
+// ---- Hygon BW (gfx936) native wave64 DUMMA (v_mmac_f32_16x16x16_bf16) attention kernels (<= 49 KB LDS) ----
+// Replaces the 97.5-99 KB dynamic-smem NVIDIA kernels on BW where per-workgroup LDS limit is 64 KB.
+namespace fab_bw {
+constexpr int WAVES = 4, ROWS = WAVES * 16, TILE = 32, DIM = 256, LS = DIM + 8, PS = TILE + 8;
+__host__ __device__ constexpr size_t smem_core() { return 2 * size_t(TILE) * LS * sizeof(__nv_bfloat16) + size_t(WAVES * 16) * PS * sizeof(__nv_bfloat16); }
+__host__ __device__ constexpr size_t smem() { return TQLLM_HAS_HW_MMAC ? smem_core() : (smem_core() + sizeof(tqllm_dumma::SimScratch<WAVES>)); }
+}
+
+__global__ void __launch_bounds__(256) attn_bf16_prefill_bw_k(const __nv_bfloat16 * q, const __nv_bfloat16 * kc,
+                                                              const __nv_bfloat16 * vc, __nv_bfloat16 * y,
+                                                              const int * dseq0, int nq, int heads, int kvheads,
+                                                              float scale) {
+    using namespace fab_bw;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16 * ks = reinterpret_cast<__nv_bfloat16 *>(smem_raw);       // [TILE][LS]
+    __nv_bfloat16 * vs = ks + TILE * LS;                                    // [TILE][LS]
+    __nv_bfloat16 * ps = vs + TILE * LS;                                    // [WAVES * 16][PS]
+    auto * sim = reinterpret_cast<tqllm_dumma::SimScratch<WAVES> *>(smem_raw + smem_core());
+
+    const int kh = blockIdx.x, t = threadIdx.x, wave = tqllm_dumma::wave64_id(), lid = tqllm_dumma::lane64_id();
+    const int r_in = lid & 15, k_grp = lid >> 4;
+    const int g = heads / kvheads, rows = nq * g;
+    const int r0 = (gridDim.y - 1 - blockIdx.y) * ROWS;
+    const int seq0 = *dseq0;
+    const int q_hi = min(r0 + ROWS - 1, rows - 1) / g;
+    const int key_end = seq0 + q_hi, ntile = (key_end + TILE - 1) / TILE;
+
+    const int r_loc = wave * 16 + r_in, rr = min(r0 + r_loc, rows - 1);
+    const int lim = seq0 + rr / g;
+    const __nv_bfloat16 * qr = q + (int64_t(rr / g) * heads + kh * g + rr % g) * DIM;
+    tqllm_dumma::FragB16x4 q_frag[DIM / 16];
+#pragma unroll
+    for (int kk = 0; kk < DIM / 16; ++kk)
+        *reinterpret_cast<uint2 *>(q_frag[kk].x) = *reinterpret_cast<const uint2 *>(qr + kk * 16 + 4 * k_grp);
+
+    const float sl2 = scale * 1.4426950408889634f;
+    tqllm_dumma::AccF32x4 o_acc[DIM / 16];
+#pragma unroll
+    for (int np = 0; np < DIM / 16; ++np) o_acc[np] = tqllm_dumma::zero_f32x4();
+    float m_row = -CUDART_INF_F, l_row = 0.f;
+
+    for (int u = 0; u < ntile; ++u) {
+        const int t0 = u * TILE;
+        __syncthreads();
+        for (int i = t; i < TILE * (DIM / 8); i += 256) {
+            const int p = i / (DIM / 8), c = i % (DIM / 8);
+            __nv_bfloat16 * dk = ks + p * LS + c * 8, * dv = vs + p * LS + c * 8;
+            if (t0 + p < key_end) {
+                const int64_t src = (int64_t(t0 + p) * kvheads + kh) * DIM + c * 8;
+                *reinterpret_cast<uint4 *>(dk) = *reinterpret_cast<const uint4 *>(kc + src);
+                *reinterpret_cast<uint4 *>(dv) = *reinterpret_cast<const uint4 *>(vc + src);
+            } else {
+                *reinterpret_cast<uint4 *>(dk) = make_uint4(0, 0, 0, 0);
+                *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
+            }
+        }
+        __syncthreads();
+
+        tqllm_dumma::AccF32x4 s_acc[2] = {tqllm_dumma::zero_f32x4(), tqllm_dumma::zero_f32x4()};
+#pragma unroll
+        for (int kk = 0; kk < DIM / 16; ++kk) {
+            const tqllm_dumma::FragB16x4 kb0 = tqllm_dumma::load_b_colmajor_b16(ks + 0 * LS + kk * 16, LS);
+            const tqllm_dumma::FragB16x4 kb1 = tqllm_dumma::load_b_colmajor_b16(ks + 16 * LS + kk * 16, LS);
+            s_acc[0] = tqllm_dumma::mmac_f32_16x16x16_bf16(q_frag[kk], kb0, s_acc[0], *sim);
+            s_acc[1] = tqllm_dumma::mmac_f32_16x16x16_bf16(q_frag[kk], kb1, s_acc[1], *sim);
+        }
+
+        float mx_loc = -CUDART_INF_F;
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int key = t0 + nt * 16 + k_grp + 4 * i;
+                float x = key < lim ? s_acc[nt].x[i] * sl2 : -CUDART_INF_F;
+                s_acc[nt].x[i] = x;
+                mx_loc = fmaxf(mx_loc, x);
+            }
+        const float mx = tqllm_dumma::row_group4_max(mx_loc, *sim);
+        const float m_new = fmaxf(m_row, mx);
+        const float m_safe = m_new > -CUDART_INF_F ? m_new : 0.f;
+        const float alpha = m_row > -CUDART_INF_F ? exp2f(m_row - m_safe) : 0.f;
+        m_row = m_new;
+#pragma unroll
+        for (int np = 0; np < DIM / 16; ++np)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) o_acc[np].x[i] *= alpha;
+
+        float s_loc = 0.f;
+        __nv_bfloat16 * prow = ps + r_loc * PS;
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float pv = s_acc[nt].x[i] > -CUDART_INF_F ? exp2f(s_acc[nt].x[i] - m_safe) : 0.f;
+                s_loc += pv;
+                prow[nt * 16 + k_grp + 4 * i] = __float2bfloat16_rn(pv);
+            }
+        l_row = l_row * alpha + s_loc;
+        tqllm_dumma::wave64_barrier();
+
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+            const tqllm_dumma::FragB16x4 pf = tqllm_dumma::load_a_rowmajor_b16(ps + (wave * 16) * PS + kk * 16, PS);
+#pragma unroll
+            for (int np = 0; np < DIM / 16; ++np) {
+                const tqllm_dumma::FragB16x4 vf = tqllm_dumma::load_b_rowmajor_b16(vs + kk * 16 * LS + np * 16, LS);
+                o_acc[np] = tqllm_dumma::mmac_f32_16x16x16_bf16(pf, vf, o_acc[np], *sim);
+            }
+        }
+    }
+
+    l_row = tqllm_dumma::row_group4_sum(l_row, *sim);
+    const float inv_l = l_row > 0.f ? 1.f / l_row : 0.f;
+    const int ga = r0 + r_loc;
+    if (ga < rows) {
+        __nv_bfloat16 * yr = y + (int64_t(ga / g) * heads + kh * g + ga % g) * DIM;
+#pragma unroll
+        for (int np = 0; np < DIM / 16; ++np)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) yr[np * 16 + k_grp + 4 * i] = __float2bfloat16_rn(o_acc[np].x[i] * inv_l);
+    }
+}
+
+namespace mq_bw {
+constexpr int DIM = 256, KS = DIM + 8, SCS = MQ_TILE + 4, PS = MQ_TILE + 8;
+__host__ __device__ constexpr size_t smem_core() {
+    return 2 * size_t(MQ_TILE) * KS * sizeof(__nv_bfloat16) +
+           size_t(MQ_MAXROWS) * SCS * sizeof(float) +
+           size_t(MQ_MAXROWS) * PS * sizeof(__nv_bfloat16);
+}
+__host__ __device__ constexpr size_t smem() { return TQLLM_HAS_HW_MMAC ? smem_core() : (smem_core() + sizeof(tqllm_dumma::SimScratch<4>)); }
+}
+
+template <int DIM, bool Q8>
+__global__ void __launch_bounds__(DIM) attn_mq_bw_k(const __nv_bfloat16 * q, const void * kc_, const void * vc_,
+                                                    const __half * ksc, const __half * vsc, float * part,
+                                                    const int * dseq0, int nq, int heads, int kvheads, float scale,
+                                                    int nsplit, int query_offset, int pstride, int blk,
+                                                    const int * dep = nullptr) {
+    constexpr int MT = MQ_MAXROWS / 16, KS = mq_bw::KS, SCS = mq_bw::SCS, PS = mq_bw::PS;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __nv_bfloat16 * ks = reinterpret_cast<__nv_bfloat16 *>(smem_raw);       // [MQ_TILE][KS]
+    __nv_bfloat16 * vs = ks + MQ_TILE * KS;                                 // [MQ_TILE][KS]
+    float * sc = reinterpret_cast<float *>(vs + MQ_TILE * KS);              // [MQ_MAXROWS][SCS]
+    __nv_bfloat16 * ps = reinterpret_cast<__nv_bfloat16 *>(sc + MQ_MAXROWS * SCS);  // [MQ_MAXROWS][PS]
+    auto * sim = reinterpret_cast<tqllm_dumma::SimScratch<4> *>(smem_raw + mq_bw::smem_core());
+
+    const auto * kc = static_cast<const __nv_bfloat16 *>(kc_), * vc = static_cast<const __nv_bfloat16 *>(vc_);
+    const auto * kq = static_cast<const int8_t *>(kc_), * vq = static_cast<const int8_t *>(vc_);
+    auto mrow_ = [&](int r) -> float & { return sc[r * SCS + MQ_TILE]; };
+    auto lrow_ = [&](int r) -> float & { return sc[r * SCS + MQ_TILE + 1]; };
+    auto arow_ = [&](int r) -> float & { return sc[r * SCS + MQ_TILE + 2]; };
+
+    const int kh = blockIdx.x, split = blockIdx.y, t = threadIdx.x, lane32 = t & 31;
+    const int wave = tqllm_dumma::wave64_id(), lid = tqllm_dumma::lane64_id(), r_in = lid & 15, k_grp = lid >> 4;
+    const int g = heads / kvheads, rows = nq * g, mt = (rows + 15) / 16;
+    const int seq0 = *dseq0 + query_offset, seq_last = seq0 + nq - 1;
+    const int stride = nsplit * MQ_TILE, beg = split * MQ_TILE, end = blk ? seq0 - 1 : seq_last;
+
+    __shared__ int lim[MQ_MAXROWS];
+    if (t < MQ_MAXROWS) {
+        const int z = t / g;
+        lim[t] = blk ? tq_split_point(seq0 - 1 + (dep ? dep[min(z, nq - 1)] : z)) : seq0 + z;
+    }
+    for (int r = t; r < MQ_MAXROWS; r += blockDim.x) {
+        mrow_(r) = -CUDART_INF_F;
+        lrow_(r) = 0.f;
+        arow_(r) = 0.f;
+    }
+
+    const int d0 = wave * 64;  // each wave64 owns 64 PV output dimensions (4 x 16-col DUMMA tiles)
+    tqllm_dumma::AccF32x4 o_acc[MT][4];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o_acc[m][j] = tqllm_dumma::zero_f32x4();
+
+    auto load_q_frag = [&](int m_tile, int kk) -> tqllm_dumma::FragB16x4 {
+        tqllm_dumma::FragB16x4 f = {{0, 0, 0, 0}};
+        const int r = m_tile * 16 + r_in;
+        if (r < rows) {
+            const __nv_bfloat16 * qp = q + (int64_t(r / g) * heads + kh * g + r % g) * DIM + kk * 16 + 4 * k_grp;
+            *reinterpret_cast<uint2 *>(f.x) = *reinterpret_cast<const uint2 *>(qp);
+        }
+        return f;
+    };
+
+    for (int t0 = beg; t0 < end; t0 += stride) {
+        const int n = min(MQ_TILE, end - t0);
+        __syncthreads();
+        if constexpr (Q8) {
+            for (int i = t; i < MQ_TILE * (DIM / 16); i += blockDim.x) {
+                const int p = i / (DIM / 16), c = i % (DIM / 16);
+                uint4 ok0 = make_uint4(0, 0, 0, 0), ok1 = ok0, ov0 = ok0, ov1 = ok0;
+                if (p < n) {
+                    const int64_t si = (int64_t(t0 + p) * kvheads + kh) * (DIM / 32) + c / 2;
+                    const float fk = __half2float(ksc[si]), fv = __half2float(vsc[si]);
+                    const int64_t bi = (int64_t(t0 + p) * kvheads + kh) * DIM + c * 16;
+                    const uint4 rk = *reinterpret_cast<const uint4 *>(kq + bi);
+                    const uint4 rv = *reinterpret_cast<const uint4 *>(vq + bi);
+                    const int8_t * bk = reinterpret_cast<const int8_t *>(&rk);
+                    const int8_t * bv = reinterpret_cast<const int8_t *>(&rv);
+                    uint32_t wk[8], wv[8];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        wk[e] = pack_bf16(float(bk[2 * e]) * fk, float(bk[2 * e + 1]) * fk);
+                        wv[e] = pack_bf16(float(bv[2 * e]) * fv, float(bv[2 * e + 1]) * fv);
+                    }
+                    ok0 = make_uint4(wk[0], wk[1], wk[2], wk[3]);
+                    ok1 = make_uint4(wk[4], wk[5], wk[6], wk[7]);
+                    ov0 = make_uint4(wv[0], wv[1], wv[2], wv[3]);
+                    ov1 = make_uint4(wv[4], wv[5], wv[6], wv[7]);
+                }
+                uint4 * dk = reinterpret_cast<uint4 *>(ks + p * KS + c * 16);
+                uint4 * dv = reinterpret_cast<uint4 *>(vs + p * KS + c * 16);
+                dk[0] = ok0; dk[1] = ok1;
+                dv[0] = ov0; dv[1] = ov1;
+            }
+        } else {
+            for (int i = t; i < MQ_TILE * (DIM / 8); i += blockDim.x) {
+                const int p = i / (DIM / 8), c = i % (DIM / 8);
+                __nv_bfloat16 * dk = ks + p * KS + c * 8, * dv = vs + p * KS + c * 8;
+                if (p < n) {
+                    const int64_t src = (int64_t(t0 + p) * kvheads + kh) * DIM + c * 8;
+                    *reinterpret_cast<uint4 *>(dk) = *reinterpret_cast<const uint4 *>(kc + src);
+                    *reinterpret_cast<uint4 *>(dv) = *reinterpret_cast<const uint4 *>(vc + src);
+                } else {
+                    *reinterpret_cast<uint4 *>(dk) = make_uint4(0, 0, 0, 0);
+                    *reinterpret_cast<uint4 *>(dv) = make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+        __syncthreads();
+
+        // QK Pass 1: waves 0..3 cover (m_tile = wave >> 1 in {0, 1}, nt = wave & 1 in {0, 1}).
+        {
+            const int m_p = wave >> 1, nt = wave & 1;
+            tqllm_dumma::AccF32x4 c_acc = tqllm_dumma::zero_f32x4();
+#pragma unroll
+            for (int kk = 0; kk < DIM / 16; ++kk) {
+                const tqllm_dumma::FragB16x4 qa = load_q_frag(m_p, kk);
+                const tqllm_dumma::FragB16x4 kb = tqllm_dumma::load_b_colmajor_b16(ks + nt * 16 * KS + kk * 16, KS);
+                c_acc = tqllm_dumma::mmac_f32_16x16x16_bf16(qa, kb, c_acc, *sim);
+            }
+            if (m_p < mt) {
+                const int r = m_p * 16 + r_in;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int p = nt * 16 + k_grp + 4 * i;
+                    sc[r * SCS + p] = (r < rows && p < n && t0 + p < lim[min(r, MQ_MAXROWS - 1)]) ? c_acc.x[i] * scale : -CUDART_INF_F;
+                }
+            }
+        }
+        // QK Pass 2: m_tile = 2 when mt > 2 (waves 0, 1 write nt = 0, 1).
+        if (mt > 2) {
+            const int nt = wave & 1;
+            tqllm_dumma::AccF32x4 c_acc = tqllm_dumma::zero_f32x4();
+#pragma unroll
+            for (int kk = 0; kk < DIM / 16; ++kk) {
+                const tqllm_dumma::FragB16x4 qa = load_q_frag(2, kk);
+                const tqllm_dumma::FragB16x4 kb = tqllm_dumma::load_b_colmajor_b16(ks + nt * 16 * KS + kk * 16, KS);
+                c_acc = tqllm_dumma::mmac_f32_16x16x16_bf16(qa, kb, c_acc, *sim);
+            }
+            if (wave < 2) {
+                const int r = 32 + r_in;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int p = nt * 16 + k_grp + 4 * i;
+                    sc[r * SCS + p] = (r < rows && p < n && t0 + p < lim[min(r, MQ_MAXROWS - 1)]) ? c_acc.x[i] * scale : -CUDART_INF_F;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (t < rows * 4) {
+            const int r = t / 4, q4 = t & 3;
+            const unsigned qm4 = 0xFu << (lane32 & 28);
+            float * row = sc + r * SCS + q4;
+            float v[8], mx = -CUDART_INF_F;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) mx = fmaxf(mx, v[i] = row[4 * i]);
+            mx = fmaxf(mx, __shfl_xor_sync(qm4, mx, 1, 32));
+            mx = fmaxf(mx, __shfl_xor_sync(qm4, mx, 2, 32));
+            const float mold = mrow_(r), mnew = fmaxf(mold, mx);
+            float sum = 0.f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float e = v[i] > -CUDART_INF_F ? __expf(v[i] - mnew) : 0.f;
+                ps[r * PS + 4 * i + q4] = __float2bfloat16_rn(e);
+                sum += e;
+            }
+            sum += __shfl_xor_sync(qm4, sum, 1, 32);
+            sum += __shfl_xor_sync(qm4, sum, 2, 32);
+            if (q4 == 0) {
+                const float alpha = mold > -CUDART_INF_F ? __expf(mold - mnew) : 0.f;
+                arow_(r) = alpha;
+                lrow_(r) = lrow_(r) * alpha + sum;
+                mrow_(r) = mnew;
+            }
+        } else if (t < MQ_MAXROWS * 4) {
+            const int r = t / 4, q4 = t & 3;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) ps[r * PS + 4 * i + q4] = __float2bfloat16_rn(0.f);
+        }
+        __syncthreads();
+
+        for (int m = 0; m < mt; ++m) {
+            const int r = m * 16 + r_in;
+            const float s0 = r < rows ? arow_(r) : 0.f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) o_acc[m][j].x[i] *= s0;
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                const tqllm_dumma::FragB16x4 pf = tqllm_dumma::load_a_rowmajor_b16(ps + (m * 16) * PS + kk * 16, PS);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const tqllm_dumma::FragB16x4 vf = tqllm_dumma::load_b_rowmajor_b16(vs + kk * 16 * KS + d0 + j * 16, KS);
+                    o_acc[m][j] = tqllm_dumma::mmac_f32_16x16x16_bf16(pf, vf, o_acc[m][j], *sim);
+                }
+            }
+        }
+    }
+
+    auto out = [&](int r) { return part + ((int64_t(r / g) * heads + kh * g + r % g) * pstride + split) * (DIM + 2); };
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+        const int r = m * 16 + r_in;
+        if (r < rows) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) out(r)[d0 + j * 16 + k_grp + 4 * i] = o_acc[m][j].x[i];
+        }
+    }
+    if (t < rows) {
+        out(t)[DIM] = mrow_(t);
+        out(t)[DIM + 1] = lrow_(t);
+    }
+}
+
 template <bool Q8, bool TURBO3V>
 void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const __half * ksc, const __half * vsc,
                __nv_bfloat16 * y, float * part, const int * dseq0, int nq, int h, int kh, float scale, int nsplit,
@@ -1623,6 +2003,38 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
     if (h <= 0 || kh <= 0 || h % kh || h / kh > MQ_MAXROWS || nq <= 0)
         throw std::invalid_argument("attention_mq256: invalid head or query count");
     constexpr int DIM = 256, KS = DIM + 8;
+#if TQLLM_USE_BW_PRIMITIVES
+    static_assert(!TURBO3V, "Turbo3 V is served by attn_ctv_k");
+    static bool configured_bw = false;
+    if (!configured_bw) {
+        cudaFuncSetAttribute(attn_mq_bw_k<DIM, Q8>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(mq_bw::smem()));
+        configured_bw = true;
+    }
+    if (par) {
+        if (Q8 || TURBO3V || query_offset) throw std::invalid_argument("tree attention: BF16 K/V, one verify block");
+        const int qmax = MQ_MAXROWS / (h / kh);
+        for (int z0 = 0; z0 < nq; z0 += qmax) {
+            const int nz = std::min(qmax, nq - z0);
+            if (dep == nullptr && z0) throw std::invalid_argument("tree attention: > 8 queries need node depths");
+            attn_mq_bw_k<DIM, Q8><<<dim3(kh, nsplit), DIM, mq_bw::smem(), s>>>(
+                q + int64_t(z0) * h * DIM, kc, vc, ksc, vsc, part + int64_t(z0) * h * (nsplit + 1) * (DIM + 2), dseq0, nz, h,
+                kh, scale, nsplit, 0, nsplit + 1, 1, dep ? dep + z0 : nullptr);
+        }
+        attn_blk_k<DIM><<<dim3(h, nq), DIM, 0, s>>>(q, static_cast<const __nv_bfloat16 *>(kc),
+                                                    static_cast<const __nv_bfloat16 *>(vc), part, dseq0, par, dep, h, kh,
+                                                    scale, nsplit, nsplit + 1, y);
+        return;
+    }
+    const int qmax = MQ_MAXROWS / (h / kh);
+    for (int z0 = 0; z0 < nq; z0 += qmax) {
+        const int nz = std::min(qmax, nq - z0);
+        const int64_t offset = int64_t(z0) * h * DIM;
+        attn_mq_bw_k<DIM, Q8><<<dim3(kh, nsplit), DIM, mq_bw::smem(), s>>>(
+            q + offset, kc, vc, ksc, vsc, part, dseq0, nz, h, kh, scale, nsplit, query_offset + z0, nsplit, 0);
+        attn_gen_merge_k<DIM><<<dim3(h, nz), DIM, 0, s>>>(part, y + offset, nsplit, h);
+    }
+    return;
+#else
     constexpr bool Q8V = Q8 && !TURBO3V;
     constexpr size_t V3B = (DIM / 128) * 50;
     const size_t smem = (size_t(MQ_MAXROWS) + (Q8 ? 2 : 4) * MQ_TILE) * KS * 2 +
@@ -1658,6 +2070,7 @@ void mq_launch(const __nv_bfloat16 * q, const void * kc, const void * vc, const 
             q + offset, kc, vc, ksc, vsc, part, dseq0, nz, h, kh, scale, nsplit, query_offset + z0, nsplit, 0);
         attn_gen_merge_k<DIM><<<dim3(h, nz), DIM, 0, s>>>(part, y + offset, nsplit, h);
     }
+#endif
 }
 
 void attention_mq256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc, __nv_bfloat16 * y,
@@ -1669,7 +2082,20 @@ void attention_mq256(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __
 void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, const __nv_bfloat16 * vc,
                              __nv_bfloat16 * y, float * part, size_t part_floats, const int * dseq0, int nq, int h, int kh,
                              float scale, int nsplit, cudaStream_t s) {
-    constexpr int DIM = 256;
+    (void) part;
+    (void) part_floats;
+    (void) nsplit;
+#if TQLLM_USE_BW_PRIMITIVES
+    static bool configured_bw = false;
+    if (!configured_bw) {
+        if (cudaFuncSetAttribute(attn_bf16_prefill_bw_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab_bw::smem())) !=
+            cudaSuccess)
+            throw std::runtime_error("attention_mq256_prefill: BW shared memory configuration failed");
+        configured_bw = true;
+    }
+    const int blocks = ((h / kh) * nq + fab_bw::ROWS - 1) / fab_bw::ROWS;
+    attn_bf16_prefill_bw_k<<<dim3(kh, blocks), 256, fab_bw::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
+#else
     static bool configured = false;
     if (!configured) {
         if (cudaFuncSetAttribute(attn_bf16_prefill_k, cudaFuncAttributeMaxDynamicSharedMemorySize, int(fab::smem())) !=
@@ -1679,6 +2105,7 @@ void attention_mq256_prefill(const __nv_bfloat16 * q, const __nv_bfloat16 * kc, 
     }
     const int blocks = ((h / kh) * nq + fab::ROWS - 1) / fab::ROWS;
     attn_bf16_prefill_k<<<dim3(kh, blocks), fab::NW * 32, fab::smem(), s>>>(q, kc, vc, y, dseq0, nq, h, kh, scale);
+#endif
 }
 
 void attention_mq256_q8(const __nv_bfloat16 * q, const int8_t * kc, const int8_t * vc, const __half * ksc,

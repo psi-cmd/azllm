@@ -481,8 +481,10 @@ public:
             x.put(values); w.put(dense(name, 128 * 1024 * 1024));
             cublasHandle_t handle = nullptr;
             require(cublasCreate(&handle) == CUBLAS_STATUS_SUCCESS, "cannot create Q6_K diagnostic handle");
+#ifndef TQLLM_BW
             require(cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH) == CUBLAS_STATUS_SUCCESS,
                     "cannot select Q6_K diagnostic math mode");
+#endif
             const float alpha = 1.f, beta = 0.f;
             const auto rc = cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols, &alpha,
                                        w.p, cols, x.p, cols, &beta, output, rows);

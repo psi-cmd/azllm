@@ -364,11 +364,13 @@ void kv_compact_block(const void * hk, const void * hv, KvCodec kcodec, KvCodec 
         if (cudaMalloc(&work, size_t(lwork) * 4) != cudaSuccess) throw std::runtime_error("kv compaction: workspace allocation");
         work_n = lwork;
     }
+#ifndef TQLLM_BW
     // TF32 tensor cores for the GEMMs (the handle is the engine's: its mode is restored on return)
     cublasMath_t math_prev;
     check(cublasGetMathMode(blas, &math_prev), "math mode");
     check(cublasSetMathMode(blas, CUBLAS_TF32_TENSOR_OP_MATH), "math mode");
     struct Restore { cublasHandle_t h; cublasMath_t m; ~Restore() { cublasSetMathMode(h, m); } } restore{blas, math_prev};
+#endif
     for (int kh = 0; kh < kvh; ++kh) {
         gather_q_k<<<nq, DIM, 0, s>>>(ring, r_used, heads, g, kh, qf, ring_rows, ring_end);
         // L[q][j] = scale * q . k_j  (row-major [nq][nb] = column-major [nb][nq]); k rows strided by kvh * 256

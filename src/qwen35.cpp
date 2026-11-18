@@ -99,8 +99,16 @@ struct KvRef {  // a view of one layer's KV rows in the KV store's pool (src/kv_
 
 struct HostBuf {
     void * p = nullptr;
-    explicit HostBuf(size_t bytes) { if (bytes) ck(cudaHostAlloc(&p, bytes, cudaHostAllocPortable)); }
+    size_t cap = 0;
+    HostBuf() = default;
+    explicit HostBuf(size_t bytes) { ensure(bytes); }
     ~HostBuf() { if (p) cudaFreeHost(p); }
+    void ensure(size_t bytes) {
+        if (bytes <= cap) return;
+        if (p) { cudaFreeHost(p); p = nullptr; cap = 0; }
+        ck(cudaHostAlloc(&p, bytes, cudaHostAllocPortable));
+        cap = bytes;
+    }
     HostBuf(const HostBuf &) = delete;
     HostBuf & operator=(const HostBuf &) = delete;
 };
@@ -371,7 +379,9 @@ public:
             eos_ = tokenizer.eos_id();
             cb(cublasCreate(&blas));
             cb(cublasSetStream(blas, stream));
+#ifndef TQLLM_BW
             cb(cublasSetMathMode(blas, CUBLAS_TENSOR_OP_MATH));
+#endif
             auto memlog = [](const char * stage) {  // TQLLM_DEBUG=memlog: device memory in use after each load stage
                 static const bool on = tqllm::debug_on("memlog");
                 size_t fr = 0, tot = 0;
@@ -2418,26 +2428,44 @@ private:
         const int rc = gemm_w_rows && rb
                            ? int(std::min<size_t>(m.rows, gemm_w_elems / size_t(m.cols) / 256 * 256)) : m.rows;
         if (rc < m.rows) {  // capped FP16 buffer: dequantise + GEMM in row blocks (results written in place in gemm_c)
-            const __half alpha = __float2half(1.f), beta = __float2half(0.f);
             for (int r0 = 0; r0 < m.rows; r0 += rc) {
                 Mat v = m;
                 v.p = static_cast<const uint8_t *>(m.p) + size_t(r0) * rb;
                 v.aux = static_cast<const uint8_t *>(m.aux) + size_t(r0) * ab;
                 v.rows = std::min(rc, m.rows - r0);
                 m.fmt->dequant_h(v, gemm_w.as<__half>(), stream);
-                cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, v.rows, np, m.cols, &alpha, gemm_w.p, CUDA_R_16F, m.cols,
-                                v_xh.p, CUDA_R_16F, m.cols, &beta, gemm_c.as<__half>() + r_off + r0, CUDA_R_16F, ldo,
-                                CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                gemm_h16(v.rows, np, m.cols, gemm_c.as<__half>() + r_off + r0, ldo);
             }
             return;
         }
         if (gemm_w_rows && size_t(m.rows) * m.cols > gemm_w_elems)
             throw std::runtime_error(std::string(m.fmt->name()) + ": capped prefill GEMM buffer needs a row-sliceable format");
         m.fmt->dequant_h(m, gemm_w.as<__half>(), stream);
+        gemm_h16(m.rows, np, m.cols, gemm_c.as<__half>() + r_off, ldo);
+    }
+    // c (FP16, column j at c + j * ldo) = gemm_w [rows x cols] applied to the np columns of v_xh.
+    // NVIDIA: FP16 accumulate (2x tensor rate on GA10x).
+    // BW / DTK: FP16-accumulate GEMMs take a non-matrix-core path on gfx936 (9-20 TFLOPS vs 275-350 for FP32 accumulate
+    // with FP16 output), and hipBLAS Tensile falls off a cliff when M > 32768 (e.g. fused w_gu M = 34816 drops to ~39 TFLOPS),
+    // so accumulate in FP32 and tile M <= 24576 there.
+    void gemm_h16(int rows, int np, int cols, __half * c, int ldo) {
+#ifdef TQLLM_BW
+        const float alpha = 1.f, beta = 0.f;
+        constexpr int kMaxM = 24576;
+        const int step = rows > 32768 ? kMaxM : rows;
+        for (int r0 = 0; r0 < rows; r0 += step) {
+            const int m = std::min(step, rows - r0);
+            cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m, np, cols, &alpha,
+                            gemm_w.as<__half>() + size_t(r0) * cols, CUDA_R_16F, cols,
+                            v_xh.p, CUDA_R_16F, cols, &beta, c + r0, CUDA_R_16F, ldo,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
+#else
         const __half alpha = __float2half(1.f), beta = __float2half(0.f);
-        cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, m.rows, np, m.cols, &alpha, gemm_w.p, CUDA_R_16F, m.cols,
-                        v_xh.p, CUDA_R_16F, m.cols, &beta, gemm_c.as<__half>() + r_off, CUDA_R_16F, ldo,
+        cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, np, cols, &alpha, gemm_w.p, CUDA_R_16F, cols,
+                        v_xh.p, CUDA_R_16F, cols, &beta, c, CUDA_R_16F, ldo,
                         CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+#endif
     }
 
     void rot_h(const bf16 * x, __half * xh, int k, int n) {
@@ -5037,26 +5065,29 @@ public:
     }
     uint32_t prefill_progress() const override { return pf_progress_done(); }
     std::vector<uint32_t> spec_tokens(int s) const override { return s == active ? gen.out : parked[size_t(s)].gen.out; }
+    HostBuf feat_tok_h, feat_pos_h, feat_out_h;  // reused across drafter_features / prefill_state (avoids 400+ MB per-call pinning)
+
     int drafter_features(const std::vector<uint32_t> & tokens, std::vector<uint16_t> & feats) override {
         if (!dfl.present) return 0;
         const auto P = uint32_t(tokens.size());
         if (P == 0 || P + 1 > context_) throw std::runtime_error("drafter_features: sequence exceeds the context");
         const int H = int(cfg.hidden), nf = int(dfl.target_ids.size()), CH = NPF;
         const size_t chunks = (P + CH - 1) / CH, row = size_t(nf) * H;
-        feats.assign(size_t(P) * row, 0);
-        HostBuf staged_tokens(size_t(P) * sizeof(uint32_t)), staged_pos(chunks * 2 * sizeof(int)),
-            staged_feat(size_t(CH) * row * 2);
-        std::memcpy(staged_tokens.p, tokens.data(), size_t(P) * sizeof(uint32_t));
-        auto * positions = static_cast<int *>(staged_pos.p);
+        feats.resize(size_t(P) * row);
+        feat_tok_h.ensure(size_t(P) * sizeof(uint32_t));
+        feat_pos_h.ensure(chunks * 2 * sizeof(int));
+        feat_out_h.ensure(size_t(std::min<uint32_t>(P, uint32_t(CH))) * row * 2);
+        std::memcpy(feat_tok_h.p, tokens.data(), size_t(P) * sizeof(uint32_t));
+        auto * positions = static_cast<int *>(feat_pos_h.p);
         for (size_t i = 0; i < chunks; ++i) positions[2 * i] = int(i * CH), positions[2 * i + 1] = int(i * CH) + 1;
         for (uint32_t t = 0; t < P; t += uint32_t(CH)) {
             const int m = int(std::min<uint32_t>(uint32_t(CH), P - t));
             prefill_final = false;  // no LM head: only the captured features are needed
-            verify_async(static_cast<const uint32_t *>(staged_tokens.p) + t, positions + 2 * (t / CH), m, t, nullptr, false);
-            ck(cudaMemcpyAsync(staged_feat.p, v_feat.p, size_t(m) * row * 2, cudaMemcpyDeviceToHost, stream));
+            verify_async(static_cast<const uint32_t *>(feat_tok_h.p) + t, positions + 2 * (t / CH), m, t, nullptr, false);
+            ck(cudaMemcpyAsync(feat_out_h.p, v_feat.p, size_t(m) * row * 2, cudaMemcpyDeviceToHost, stream));
             commit(m);
             sync_ck();
-            std::memcpy(feats.data() + size_t(t) * row, staged_feat.p, size_t(m) * row * 2);
+            std::memcpy(feats.data() + size_t(t) * row, feat_out_h.p, size_t(m) * row * 2);
         }
         return nf;
     }
@@ -5068,14 +5099,15 @@ public:
         pc_drop();
         const int CH = NPF;
         const size_t chunks = (P + CH - 1) / CH;
-        HostBuf staged_tokens(size_t(P) * sizeof(uint32_t)), staged_pos(chunks * 2 * sizeof(int));
-        std::memcpy(staged_tokens.p, tokens.data(), size_t(P) * sizeof(uint32_t));
-        auto * positions = static_cast<int *>(staged_pos.p);
+        feat_tok_h.ensure(size_t(P) * sizeof(uint32_t));
+        feat_pos_h.ensure(chunks * 2 * sizeof(int));
+        std::memcpy(feat_tok_h.p, tokens.data(), size_t(P) * sizeof(uint32_t));
+        auto * positions = static_cast<int *>(feat_pos_h.p);
         for (size_t i = 0; i < chunks; ++i) positions[2 * i] = int(pos0 + i * CH), positions[2 * i + 1] = int(pos0 + i * CH) + 1;
         for (uint32_t t = 0; t < P; t += uint32_t(CH)) {
             const int m = int(std::min<uint32_t>(uint32_t(CH), P - t));
             prefill_final = false;
-            verify_async(static_cast<const uint32_t *>(staged_tokens.p) + t, positions + 2 * (t / CH), m, pos0 + t, nullptr, false);
+            verify_async(static_cast<const uint32_t *>(feat_tok_h.p) + t, positions + 2 * (t / CH), m, pos0 + t, nullptr, false);
             commit(m);
             sync_ck();
         }

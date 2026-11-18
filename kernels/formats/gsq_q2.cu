@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "../bw_primitives.cuh"
 #include "gsq_q2.cuh"
 #include <climits>
 #include <cstdlib>
@@ -23,13 +24,13 @@ template<class T> __global__ void dot(const unsigned char * weights, const __hal
     if (expert >= 0 && expert < experts)
         for (int j = threadIdx.x; j < cols; j += blockDim.x)
             sum += value(weights, (int64_t(expert) * rows + row) * cols + j) * __half2float(x[int64_t(input) * cols + j]);
-    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
     __shared__ float partial[4];
     if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = sum;
     __syncthreads();
     if (threadIdx.x < 32) {
         sum = threadIdx.x < 4 ? partial[threadIdx.x] : 0.f;
-        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, d, 32);
         if (!threadIdx.x) {
             if (expert < 0 || expert >= experts) sum = nanf("");
             if constexpr (std::is_same_v<T, float>) y[int64_t(assignment) * rows + row] = sum;
@@ -147,7 +148,7 @@ void gsq_q2_expert_grouped(const void * w, const __half * x, __nv_bfloat16 * y, 
     shape(w, x, y, r, k, 1, 1);
     if (!counts || !groups || experts <= 0 || experts > 65535 || capacity <= 0 || int64_t(experts) * r > INT_MAX)
         throw std::invalid_argument("GSQ Q2_0: invalid grouped expert dimensions");
-    constexpr int C = 16;
+    constexpr int C = TQLLM_USE_BW_PRIMITIVES ? 4 : 16;  // BW (gfx936): <= 64 KB LDS per workgroup
     const size_t smem = size_t(C) * k * sizeof(__half);
     static int attr_for = 0;
     if (smem > 48 * 1024 && attr_for < int(smem)) { cudaFuncSetAttribute(dot_grouped<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)); attr_for = int(smem); }

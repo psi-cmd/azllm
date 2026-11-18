@@ -326,7 +326,20 @@ int main() {
                 same4 &= std::memcmp(a.data(), b.data(), a.size() * 2) == 0;
                 tqllm_cuda::tq4_matvec_variant(dw, ds, dx, dz, tr, tk, nc, 22, nullptr);
                 same4 &= std::memcmp(host(dz, size_t(nc) * tr).data(), a.data(), a.size() * 2) == 0;
+#ifdef TQLLM_BW
+                // BW intentionally dispatches ncols <= 2 to streaming wave64 GEMV and ncols >= 3 to wave64 DUMMA;
+                // within the same execution path outputs are bit-identical, across paths allow <= 2e-2 BF16 rounding.
+                if (nc <= 2) {
+                    same4 &= std::memcmp(a.data(), one.data(), a.size() * 2) == 0;
+                } else {
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        const double r = __bfloat162float(one[i]), q = __bfloat162float(a[i]);
+                        vs_old = std::max(vs_old, std::fabs(r - q) / (std::fabs(r) + 1e-2));
+                    }
+                }
+#else
                 same4 &= std::memcmp(a.data(), one.data(), a.size() * 2) == 0;
+#endif
                 tqllm_cuda::tq4_matvec_variant(dw, ds, dx, dz, tr, tk, nc, 2, nullptr);
                 const auto o = host(dz, size_t(nc) * tr);
                 for (size_t i = 0; i < o.size(); ++i) {
@@ -482,9 +495,28 @@ int main() {
                 same &= std::memcmp(a.data(), b.data(), a.size() * 2) == 0;              // (a)
                 tqllm_cuda::tq4b3_matvec_variant(w8, ds, dx, dz, tr, tk, nc, 22, nullptr);
                 same &= std::memcmp(host(dz, size_t(nc) * tr).data(), a.data(), a.size() * 2) == 0;  // (a) two-step mode
+#ifdef TQLLM_BW
+                if (nc <= 2) {
+                    same &= std::memcmp(a.data(), one.data(), a.size() * 2) == 0;
+                } else {
+                    for (size_t i = 0; i < a.size(); ++i) {
+                        const double r = __bfloat162float(one[i]), q = __bfloat162float(a[i]);
+                        vs_old = std::max(vs_old, std::fabs(r - q) / (std::fabs(r) + 1e-2));
+                    }
+                }
+                tqllm_cuda::tq4b3_matvec_bf16_ld(w8, ds, dx, dz, tr, tk, nc, tr, nullptr);
+                {
+                    const auto ld = host(dz, size_t(nc) * tr);
+                    for (size_t i = 0; i < ld.size(); ++i) {
+                        const double r = __bfloat162float(ld[i]), q = __bfloat162float(a[i]);
+                        vs_old = std::max(vs_old, std::fabs(r - q) / (std::fabs(r) + 1e-2));
+                    }
+                }
+#else
                 same &= std::memcmp(a.data(), one.data(), a.size() * 2) == 0;            // (b)
                 tqllm_cuda::tq4b3_matvec_bf16_ld(w8, ds, dx, dz, tr, tk, nc, tr, nullptr);
                 same &= std::memcmp(host(dz, size_t(nc) * tr).data(), a.data(), a.size() * 2) == 0;  // (c)
+#endif
                 tqllm_cuda::tq4b3_matvec_variant(w8, ds, dx, dz, tr, tk, nc, 1, nullptr);
                 const auto o = host(dz, size_t(nc) * tr);
                 for (size_t i = 0; i < o.size(); ++i) {

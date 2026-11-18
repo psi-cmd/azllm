@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "../kernels/bw_primitives.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -236,9 +237,13 @@ void run8(const char * label, const std::vector<Shape> & shapes, const uint4 * w
 // A fragment (row-major 16x16): lane holds rows g=lane/4 and g+8, k = 4*(lane%4)..+3. B (16x8): k = 4*(lane%4)..+3,
 // column n = lane/4. C (16x8): rows g, g+8; columns 2*(lane%4), +1.
 __device__ __forceinline__ void mma16816(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_s8_k16(c, a0, a1, b);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a0), "r"(a1), "r"(b));
+#endif
 }
 
 // codes for elements 16h + 4t .. +3 of a repacked block, as 4 int8 (PRMT on the int8 codebook)
@@ -423,11 +428,23 @@ void runt2(const char * label, const std::vector<Shape> & shapes, const uint4 * 
 // activations + scales into shared memory with cp.async (double buffered); warp w then runs the tensor-core math on
 // blocks 8w..8w+7 of the stage. Row stride padded by 16 B so the 8 row groups of a fragment hit different banks.
 __device__ __forceinline__ void cp16(void * smem, const void * gmem) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::cp_async16(smem, gmem);
+#else
     const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem));
+#endif
 }
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void cp_commit() {
+#if !TQLLM_USE_BW_PRIMITIVES
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_wait() {
+#if !TQLLM_USE_BW_PRIMITIVES
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
 
 template <int NCOL>
 __global__ void __launch_bounds__(128) mvt3(const uint4 * w, const int8_t * xq, const float * xs, __nv_bfloat16 * y,
@@ -544,10 +561,14 @@ void runt3(const char * label, const std::vector<Shape> & shapes, const uint4 * 
 // pair (2t, 2t+1) of each 8-element word is byte t of that word; & 0x77 gives an index into a half2 pair table.
 __device__ __forceinline__ void mma16816h(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                           uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 // half2 (s, s) for scale byte `byte` (E3M5 -> fp16 bits: (b << 5) + 0x1800; b == 0 -> 0)
@@ -557,9 +578,13 @@ __device__ __forceinline__ uint32_t scale2(uint32_t byte) {
 }
 
 __device__ __forceinline__ uint32_t hmul2(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hmul2u(a, b);
+#else
     uint32_t r;
     asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
     return r;
+#endif
 }
 
 // Scaled half2 pair for (h, which): which 0 -> elements 16h+2t,+1 (group 2h), 1 -> 16h+8+2t,+1 (group 2h+1).
@@ -757,9 +782,13 @@ void runh2(const char * label, const std::vector<Shape> & shapes, const uint4 * 
 // Decode: tq3_codes4 gives 4 int8 codebook bytes (codebook stored +128 as unsigned); PRMT with 0x64 bytes makes
 // fp16 (1024 + u); HFMA2 with (s, -1152 s) gives (u - 128) * s = c_q * s (the 1/63.5 goes into s).
 __device__ __forceinline__ uint32_t hfma2(uint32_t a, uint32_t b, uint32_t c) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hfma2u(a, b, c);
+#else
     uint32_t r;
     asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
+#endif
 }
 
 template <int NCOL, int MT>

@@ -1,5 +1,6 @@
 // TQ4 weight format kernels (see src/formats/tq4.cpp).
 #include "../../src/debug.hpp"
+#include "bw_dumma.cuh"
 #include "common.cuh"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
@@ -93,8 +94,12 @@ template <int BITS> __device__ __forceinline__ uint32_t expand_b(uint32_t c) {  
 __device__ __forceinline__ uint32_t expand_u(uint32_t c) {
     const uint32_t sel = c & 0x7777u;
     const uint32_t pos = __byte_perm(0xAC9F9286u, 0xFFE0CBBAu, sel), neg = __byte_perm(0x54616E7Au, 0x01203546u, sel);
+#if TQLLM_USE_BW_PRIMITIVES
+    const uint32_t m = tqllm_bw::prmt_b32(c << 4, c, 0xD9C8u);
+#else
     uint32_t m;
     asm("prmt.b32 %0, %1, %2, 0xD9C8;" : "=r"(m) : "r"(c << 4), "r"(c));
+#endif
     return (pos & ~m) | (neg & m);
 }
 }
@@ -646,6 +651,23 @@ __global__ void tq4_dequant_h_k(const uint8_t * w4, const __half * sc, __half * 
     reinterpret_cast<uint2 *>(out)[f] = *reinterpret_cast<const uint2 *>(v);
 }
 
+__global__ void tq4_dequant_h_vec8_k(const uint8_t * __restrict__ w4, const __half * __restrict__ sc,
+                                     __half * __restrict__ out, int64_t npairs) {
+    const int64_t p = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;  // 8 weights = 4B read, 16B write
+    if (p >= npairs) return;
+    const uint32_t w = reinterpret_cast<const uint32_t *>(w4)[p];
+    const uint32_t lv0 = tq4k::expand(w & 0xFFFFu);
+    const uint32_t lv1 = tq4k::expand(w >> 16);
+    const float s = __half2float(sc[p >> 4]);
+    const __half2 h01 = __floats2half2_rn(float(int8_t(lv0)) * s, float(int8_t(lv0 >> 8)) * s);
+    const __half2 h23 = __floats2half2_rn(float(int8_t(lv0 >> 16)) * s, float(int8_t(lv0 >> 24)) * s);
+    const __half2 h45 = __floats2half2_rn(float(int8_t(lv1)) * s, float(int8_t(lv1 >> 8)) * s);
+    const __half2 h67 = __floats2half2_rn(float(int8_t(lv1 >> 16)) * s, float(int8_t(lv1 >> 24)) * s);
+    uint4 res{tqllm_bw::h2_to_u32(h01), tqllm_bw::h2_to_u32(h23),
+              tqllm_bw::h2_to_u32(h45), tqllm_bw::h2_to_u32(h67)};
+    reinterpret_cast<uint4 *>(out)[p] = res;
+}
+
 __global__ void tq4b3_dequant_h_k(const uint8_t * w3, const __half * sc, __half * out, int64_t nfields, int k) {
     const int64_t f = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;  // 4 weights; 8 fields per 32-weight segment
     if (f >= nfields) return;
@@ -757,6 +779,363 @@ __global__ void tq4_rot_op_k(const __nv_bfloat16 * a0, __nv_bfloat16 * o, int ts
     for (int j = 0; j < 4; ++j) xh[base + j] = __float2half_rn(v[j] * 0.08838834764831845f);
 }
 
+// ---- Hygon BW (gfx936) dual-path execution kernels for TQ4 / TQ3 ----
+// 1. Streaming Wave64 GEMV (ncols <= 2, Decode N=1): stages activation K-chunks in LDS, streams weights coalesced
+//    across all 64 lanes with exact FP16 dequant ((1152 + L) - 1152) * s and FP32 wave64 reduction (no wasted 15/16 MMAC cols).
+// 2. Split-K Wave64 DUMMA (ncols = 3..32, Verify / Batch): zero-shuffle K-permutation bijection directly into
+//    v_mmac_f32_16x16x16_f16 hardware matrix units.
+template <int NCOL, class OUT, int BITS = 4>
+__global__ void __launch_bounds__(256) tq4_gemv_wave64_bw_k(const uint8_t * w4, const __half * sc, const __half * xh,
+                                                               OUT * y, int rows, int k, int nc, int ldy) {
+    __shared__ tqllm_dumma::SimScratch<4> sim;
+    const int tid = threadIdx.x, wave = tqllm_dumma::wave64_id(), lid = tqllm_dumma::lane64_id();
+    const int nb = k / 32, ng = k / 128;
+
+    auto deq = [](uint32_t lv, uint32_t sel, uint32_t su) {
+        return hmul2u(hadd2u(__byte_perm(lv, 0x64646464u, sel), 0xE480E480u), su);
+    };
+
+    if constexpr (BITS == 4) {
+        // Coalesced 16-byte (dwordx4 = 32 weights/lane, 1024 contiguous bytes/wave64) streaming GEMV across RPW=4 rows/wave.
+        constexpr int RPW = 4;
+        const int row_base = blockIdx.x * (4 * RPW) + wave * RPW;
+        if (row_base >= rows) return;
+        float acc[RPW][NCOL] = {};
+        for (int s0 = lid; s0 < nb; s0 += 64) {
+            uint4 wq[RPW];
+            uint32_t su[RPW];
+#pragma unroll
+            for (int r_i = 0; r_i < RPW; ++r_i) {
+                const int row = row_base + r_i;
+                if (row < rows) {
+                    wq[r_i] = __ldg(reinterpret_cast<const uint4 *>(w4 + int64_t(row) * (k / 2)) + s0);
+                    const uint32_t sh = __half_as_ushort(__ldg(&sc[int64_t(row) * ng + (s0 >> 2)]));
+                    su[r_i] = (sh << 16) | sh;
+                } else {
+                    wq[r_i] = make_uint4(0, 0, 0, 0);
+                    su[r_i] = 0u;
+                }
+            }
+            uint4 xq[NCOL][4];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) {
+                const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(c) * k + int64_t(s0) * 32);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) xq[c][i] = c < nc ? __ldg(&xp[i]) : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int r_i = 0; r_i < RPW; ++r_i) {
+                if (row_base + r_i >= rows) continue;
+                const uint32_t wd[4] = {wq[r_i].x, wq[r_i].y, wq[r_i].z, wq[r_i].w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t lv_lo = tq4k::expand(wd[i] & 0xFFFFu) ^ 0x80808080u;
+                    const uint32_t lv_hi = tq4k::expand(wd[i] >> 16) ^ 0x80808080u;
+                    const float2 w0 = __half22float2(tqllm_bw::u32_to_h2(deq(lv_lo, 0x5140, su[r_i])));
+                    const float2 w1 = __half22float2(tqllm_bw::u32_to_h2(deq(lv_lo, 0x5342, su[r_i])));
+                    const float2 w2 = __half22float2(tqllm_bw::u32_to_h2(deq(lv_hi, 0x5140, su[r_i])));
+                    const float2 w3 = __half22float2(tqllm_bw::u32_to_h2(deq(lv_hi, 0x5342, su[r_i])));
+#pragma unroll
+                    for (int c = 0; c < NCOL; ++c) {
+                        const float2 x0 = __half22float2(tqllm_bw::u32_to_h2(xq[c][i].x));
+                        const float2 x1 = __half22float2(tqllm_bw::u32_to_h2(xq[c][i].y));
+                        const float2 x2 = __half22float2(tqllm_bw::u32_to_h2(xq[c][i].z));
+                        const float2 x3 = __half22float2(tqllm_bw::u32_to_h2(xq[c][i].w));
+                        acc[r_i][c] = fmaf(w3.y, x3.y, fmaf(w3.x, x3.x, fmaf(w2.y, x2.y, fmaf(w2.x, x2.x,
+                                      fmaf(w1.y, x1.y, fmaf(w1.x, x1.x, fmaf(w0.y, x0.y, fmaf(w0.x, x0.x, acc[r_i][c]))))))));
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int r_i = 0; r_i < RPW; ++r_i) {
+            const int row = row_base + r_i;
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) {
+                const float sum = tqllm_dumma::wave64_sum(acc[r_i][c], sim);
+                if (lid == 0 && row < rows && c < nc) {
+                    if constexpr (std::is_same_v<OUT, float>) y[int64_t(c) * ldy + row] = sum;
+                    else y[int64_t(c) * ldy + row] = __float2bfloat16_rn(sum);
+                }
+            }
+        }
+        return;
+    }
+
+    constexpr int BK_CHUNK = 2048;  // 16 groups of 128 weights; <= 8 KB LDS for NCOL <= 2
+    constexpr int RPW = 2;          // 2 output rows per wave64 (8 rows per 256-thread CTA)
+    __shared__ __align__(16) __half xs[NCOL][BK_CHUNK];
+    const int sub = lid >> 5, fl = lid & 31;  // 2 groups of 128 per 64-lane step (32 lanes x 4 weights = 128)
+    const int row_base = blockIdx.x * (4 * RPW) + wave * RPW;
+
+    float acc[RPW][NCOL] = {};
+    for (int k0 = 0; k0 < k; k0 += BK_CHUNK) {
+        const int chunk_k = min(BK_CHUNK, k - k0), chunk_ng = chunk_k / 128;
+        for (int i = tid; i < NCOL * (chunk_k / 8); i += 256) {
+            const int c = i / (chunk_k / 8), off8 = i % (chunk_k / 8);
+            *reinterpret_cast<uint4 *>(&xs[c][off8 * 8]) =
+                c < nc ? __ldg(reinterpret_cast<const uint4 *>(xh + int64_t(c) * k + k0) + off8)
+                       : make_uint4(0, 0, 0, 0);
+        }
+        __syncthreads();
+
+        for (int lg = 0; lg < chunk_ng; lg += 2) {
+            const int g_loc = lg + sub;
+            if (g_loc < chunk_ng) {
+                const int g_abs = (k0 / 128) + g_loc;
+                float2 xv0[NCOL], xv1[NCOL];
+#pragma unroll
+                for (int c = 0; c < NCOL; ++c) {
+                    const uint2 xr = *reinterpret_cast<const uint2 *>(&xs[c][g_loc * 128 + fl * 4]);
+                    xv0[c] = __half22float2(tqllm_bw::u32_to_h2(xr.x));
+                    xv1[c] = __half22float2(tqllm_bw::u32_to_h2(xr.y));
+                }
+#pragma unroll
+                for (int r_i = 0; r_i < RPW; ++r_i) {
+                    const int row = row_base + r_i;
+                    if (row < rows) {
+                        const int seg = g_abs * 4 + (fl >> 3), q = fl & 7;
+                        const uint32_t * bp = reinterpret_cast<const uint32_t *>(w4) + int64_t(row) * nb * 3 + seg;
+                        const uint4 n3 = tq4k::nibbles3(__ldg(bp), __ldg(bp + nb), __ldg(bp + 2 * nb));
+                        const uint32_t wd = (q >> 1) == 0 ? n3.x : (q >> 1) == 1 ? n3.y : (q >> 1) == 2 ? n3.z : n3.w;
+                        const uint32_t code16 = (wd >> (16 * (q & 1))) & 0xFFFFu;
+                        const uint32_t lv = tq4k::expand_b<BITS>(code16) ^ 0x80808080u;
+                        const uint32_t su = tqllm_bw::h2_to_u32(__half2half2(__ldg(&sc[int64_t(row) * ng + g_abs])));
+                        const float2 w0 = __half22float2(tqllm_bw::u32_to_h2(deq(lv, 0x5140, su)));
+                        const float2 w1 = __half22float2(tqllm_bw::u32_to_h2(deq(lv, 0x5342, su)));
+#pragma unroll
+                        for (int c = 0; c < NCOL; ++c) {
+                            acc[r_i][c] = fmaf(w1.y, xv1[c].y, fmaf(w1.x, xv1[c].x, fmaf(w0.y, xv0[c].y, fmaf(w0.x, xv0[c].x, acc[r_i][c]))));
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r_i = 0; r_i < RPW; ++r_i) {
+        const int row = row_base + r_i;
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) {
+            const float sum = tqllm_dumma::wave64_sum(acc[r_i][c], sim);
+            if (lid == 0 && row < rows && c < nc) {
+                if constexpr (std::is_same_v<OUT, float>) y[int64_t(c) * ldy + row] = sum;
+                else y[int64_t(c) * ldy + row] = __float2bfloat16_rn(sum);
+            }
+        }
+    }
+}
+
+template <int NT16, int MT, class OUT, int BITS = 4>
+__global__ void __launch_bounds__(256, (BITS == 4 && NT16 == 1) ? 2 : 1)
+tq4_matvec_dummabw_k(const uint8_t * w4, const __half * sc, const __half * xh,
+                     OUT * y, int rows, int k, int nc, int ldy) {
+    constexpr int BM = 16 * MT;          // 32 rows per CTA
+    constexpr int NCAP = 16 * NT16;      // 16 or 32 cols
+    constexpr int WLDS = 17;             // 16 uint4s (512 weights) + 1 uint4 pad -> conflict-free across 16 rows
+    constexpr int XLDS8 = 65;            // 64 uint4s (512 halves)  + 1 uint4 pad -> conflict-free across 16 cols
+    constexpr int NXLD = 4 * NT16;       // uint4s of xh loaded per thread per 512-weight chunk
+    union SharedBuf {
+        struct {
+            uint4 ws[BM * WLDS];
+            uint4 xs[NCAP * XLDS8];
+            uint16_t scs[BM][4];
+        } stage;
+        float red[4][64][4 * MT * NT16];
+    };
+    __shared__ __align__(16) SharedBuf sh;
+    __shared__ tqllm_dumma::SimScratch<4> sim;
+    const int tid = threadIdx.x, wave = tqllm_dumma::wave64_id(), lid = tqllm_dumma::lane64_id();
+    const int r_in = lid & 15, k_grp = lid >> 4;
+    const int row0 = blockIdx.x * BM, nb = k / 32, ng = k / 128;
+
+    tqllm_dumma::AccF32x4 acc[MT][NT16];
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int tt = 0; tt < NT16; ++tt) acc[m][tt] = tqllm_dumma::zero_f32x4();
+
+    auto deq = [](uint32_t lv, uint32_t sel, uint32_t su) {
+        return hmul2u(hadd2u(__byte_perm(lv, 0x64646464u, sel), 0xE480E480u), su);
+    };
+    auto word4 = [](const uint4 & v, int j) { return j == 0 ? v.x : j == 1 ? v.y : j == 2 ? v.z : v.w; };
+
+    if constexpr (BITS == 4) {
+        // Coalesced dwordx4 global loads (256 contiguous bytes/row across 16 lanes; 1024 contiguous bytes/col across 64 lanes)
+        // with register double-buffering into conflict-free LDS, feeding Wave64 DUMMA hardware matrix units.
+        uint4 wreg[2], xreg[NXLD];
+        uint16_t sreg = 0;
+        auto issue_loads = [&](int kb0) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int u = tid + 256 * j, r = u >> 4, seg = u & 15, row = row0 + r;
+                wreg[j] = (row < rows && kb0 + (seg >> 2) < ng)
+                              ? __ldg(reinterpret_cast<const uint4 *>(w4 + int64_t(row) * (k / 2)) + int64_t(kb0) * 4 + seg)
+                              : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int j = 0; j < NXLD; ++j) {
+                const int u = tid + 256 * j, col = u >> 6, part = u & 63;
+                const int k_off = kb0 * 128 + part * 8;
+                xreg[j] = (col < nc && k_off < k)
+                              ? __ldg(reinterpret_cast<const uint4 *>(xh + int64_t(col) * k + k_off))
+                              : make_uint4(0, 0, 0, 0);
+            }
+            sreg = 0;
+            if (tid < BM * 4) {
+                const int r = tid >> 2, wk = tid & 3, row = row0 + r;
+                if (row < rows && kb0 + wk < ng)
+                    sreg = __half_as_ushort(__ldg(&sc[int64_t(row) * ng + kb0 + wk]));
+            }
+        };
+        auto commit_lds = [&]() {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int u = tid + 256 * j, r = u >> 4, seg = u & 15;
+                sh.stage.ws[r * WLDS + seg] = wreg[j];
+            }
+#pragma unroll
+            for (int j = 0; j < NXLD; ++j) {
+                const int u = tid + 256 * j, col = u >> 6, part = u & 63;
+                sh.stage.xs[col * XLDS8 + part] = xreg[j];
+            }
+            if (tid < BM * 4) sh.stage.scs[tid >> 2][tid & 3] = sreg;
+        };
+
+        issue_loads(0);
+        for (int kb0 = 0; kb0 < ng; kb0 += 4) {
+            __syncthreads();
+            commit_lds();
+            __syncthreads();
+            if (kb0 + 4 < ng) issue_loads(kb0 + 4);
+
+            const int kb = kb0 + wave;
+            const bool ok = kb < ng;
+            uint4 x_lane[NT16][4];
+#pragma unroll
+            for (int tt = 0; tt < NT16; ++tt) {
+                const int col = tt * 16 + r_in;
+                const uint4 * xp = &sh.stage.xs[col * XLDS8 + wave * 16 + k_grp * 4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) x_lane[tt][i] = xp[i];
+            }
+            uint4 w_lane[MT];
+            uint32_t s_lane[MT];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                w_lane[m] = sh.stage.ws[(m * 16 + r_in) * WLDS + wave * 4 + k_grp];
+                const uint32_t sh16 = sh.stage.scs[m * 16 + r_in][wave];
+                s_lane[m] = (sh16 << 16) | sh16;
+            }
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                tqllm_dumma::FragB16x4 fb[NT16];
+#pragma unroll
+                for (int tt = 0; tt < NT16; ++tt) {
+                    const uint4 xq = x_lane[tt][u >> 1];
+                    const uint2 xp = (u & 1) ? make_uint2(xq.z, xq.w) : make_uint2(xq.x, xq.y);
+                    *reinterpret_cast<uint2 *>(fb[tt].x) = xp;
+                }
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    const uint32_t wd = word4(w_lane[m], u >> 1);
+                    const uint32_t fld = (wd >> (16 * (u & 1))) & 0xFFFFu;
+                    const uint32_t lv = ok ? (tq4k::expand(fld) ^ 0x80808080u) : 0x80808080u;
+                    const uint2 dq = make_uint2(deq(lv, 0x5140, s_lane[m]), deq(lv, 0x5342, s_lane[m]));
+                    tqllm_dumma::FragB16x4 fa;
+                    *reinterpret_cast<uint2 *>(fa.x) = dq;
+#pragma unroll
+                    for (int tt = 0; tt < NT16; ++tt)
+                        acc[m][tt] = tqllm_dumma::mmac_f32_16x16x16_f16(fa, fb[tt], acc[m][tt], sim);
+                }
+            }
+        }
+        __syncthreads();
+    } else {
+        for (int kb0 = 0; kb0 < ng; kb0 += 4) {
+            const int kb = kb0 + wave;
+            const bool ok = kb < ng;
+            uint4 x_lane[NT16][4];
+#pragma unroll
+            for (int tt = 0; tt < NT16; ++tt) {
+                const int col = tt * 16 + r_in;
+                const bool on = ok && col < nc;
+                const uint4 * xp = reinterpret_cast<const uint4 *>(xh + int64_t(col) * k + int64_t(kb) * 128 + k_grp * 32);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) x_lane[tt][i] = on ? __ldg(&xp[i]) : make_uint4(0, 0, 0, 0);
+            }
+
+            uint4 w_lane[MT];
+            uint32_t s_lane[MT];
+#pragma unroll
+            for (int m = 0; m < MT; ++m) {
+                const int row = min(row0 + m * 16 + r_in, rows - 1);
+                if (ok) {
+                    const int s = kb * 4 + k_grp;
+                    const uint32_t * bp = reinterpret_cast<const uint32_t *>(w4) + int64_t(row) * nb * 3 + s;
+                    w_lane[m] = tq4k::nibbles3(__ldg(bp), __ldg(bp + nb), __ldg(bp + 2 * nb));
+                    s_lane[m] = tqllm_bw::h2_to_u32(__half2half2(__ldg(&sc[int64_t(row) * ng + kb])));
+                } else {
+                    w_lane[m] = make_uint4(0, 0, 0, 0);
+                    s_lane[m] = 0u;
+                }
+            }
+
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                tqllm_dumma::FragB16x4 fb[NT16];
+#pragma unroll
+                for (int tt = 0; tt < NT16; ++tt) {
+                    const uint4 xq = x_lane[tt][u >> 1];
+                    const uint2 xp = (u & 1) ? make_uint2(xq.z, xq.w) : make_uint2(xq.x, xq.y);
+                    *reinterpret_cast<uint2 *>(fb[tt].x) = xp;
+                }
+#pragma unroll
+                for (int m = 0; m < MT; ++m) {
+                    const uint32_t wd = word4(w_lane[m], u >> 1);
+                    const uint32_t fld = (wd >> (16 * (u & 1))) & 0xFFFFu;
+                    const uint32_t lv = ok ? (tq4k::expand_b<BITS>(fld) ^ 0x80808080u) : 0x80808080u;
+                    const uint2 dq = make_uint2(deq(lv, 0x5140, s_lane[m]), deq(lv, 0x5342, s_lane[m]));
+                    tqllm_dumma::FragB16x4 fa;
+                    *reinterpret_cast<uint2 *>(fa.x) = dq;
+#pragma unroll
+                    for (int tt = 0; tt < NT16; ++tt)
+                        acc[m][tt] = tqllm_dumma::mmac_f32_16x16x16_f16(fa, fb[tt], acc[m][tt], sim);
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MT; ++m)
+#pragma unroll
+        for (int tt = 0; tt < NT16; ++tt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) sh.red[wave][lid][4 * (m * NT16 + tt) + i] = acc[m][tt].x[i];
+    __syncthreads();
+    if (wave < MT) {
+        const int m = wave, row = row0 + m * 16 + r_in;
+        if (row < rows) {
+#pragma unroll
+            for (int tt = 0; tt < NT16; ++tt) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int col = tt * 16 + k_grp + 4 * i;
+                    if (col < nc) {
+                        float v = 0.f;
+#pragma unroll
+                        for (int w2 = 0; w2 < 4; ++w2) v += sh.red[w2][lid][4 * (m * NT16 + tt) + i];
+                        if constexpr (std::is_same_v<OUT, float>) y[int64_t(col) * ldy + row] = v;
+                        else y[int64_t(col) * ldy + row] = __float2bfloat16_rn(v);
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Variants (tests / benches; the engine runs 0): 0 MT 2 (default), 1 MT 2 + prefetch, 2 MT 1, 3 MT 1 + prefetch, 4 MT 4,
 // 5 MT 4 + prefetch, 6 MT 2 + weights-only prefetch, 7 MT 1 + weights-only prefetch, 8 MT 2 + two blocks per iteration
 // (loads hoisted), 9 MT 1 + two blocks per iteration. All bit-identical per column (test tq4_matvec_variants in tests/quant.cu). MT 4 only up to 8 columns (the
@@ -796,6 +1175,35 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
         if (ncols <= 8) by_pf(std::integral_constant<int, 8>{});
         else by_pf(std::integral_constant<int, 16>{});
     };
+    constexpr int gemv_rcta = BITS == 4 ? 16 : 8;
+    if (v == 30 && ncols <= 2) {
+        const int grid = (rows + gemv_rcta - 1) / gemv_rcta;
+        if (ncols == 1) tq4_gemv_wave64_bw_k<1, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+        else tq4_gemv_wave64_bw_k<2, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+        return;
+    }
+    if (v == 31) {
+        const int grid = (rows + 31) / 32;
+        if (ncols <= 16) tq4_matvec_dummabw_k<1, 2, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+        else tq4_matvec_dummabw_k<2, 2, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+        return;
+    }
+#if TQLLM_USE_BW_PRIMITIVES
+    // On Hygon BW (and BW emulation), route all matvec variants through the two BW-native wave64 kernels
+    // (streaming wave64 GEMV for Decode ncols <= 2, split-K wave64 DUMMA for Verify/Batch ncols >= 3),
+    // avoiding 132 redundant NVIDIA-specific PTX prefetch/MT template instantiations.
+    (void) v;
+    if (ncols <= 2 && v != 31) {
+        const int grid = (rows + gemv_rcta - 1) / gemv_rcta;
+        if (ncols == 1) tq4_gemv_wave64_bw_k<1, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+        else tq4_gemv_wave64_bw_k<2, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+    } else {
+        const int grid = (rows + 31) / 32;
+        if (ncols <= 16) tq4_matvec_dummabw_k<1, 2, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+        else tq4_matvec_dummabw_k<2, 2, OUT, BITS><<<grid, 256, 0, s>>>(w4, sc, xh, y, rows, k, ncols, ldy);
+    }
+    return;
+#else
     if (v >= 20 && v <= 22 && ncols <= 16) {
         launch_new(v - 20);
         return;
@@ -852,6 +1260,7 @@ static void tq4_launch_v(const uint8_t * w4, const __half * sc, const __half * x
             else if (ncols <= 24) by_mt_pf(std::integral_constant<int, 24>{});
             else by_mt_pf(std::integral_constant<int, 32>{});
     }
+#endif
 }
 
 template <class OUT>
@@ -1038,7 +1447,12 @@ void tq4b3_dequant_h(const uint8_t * w3, const __half * sc, __half * out, int ro
 }
 void tq4_dequant_h(const uint8_t * w4, const __half * sc, __half * out, int rows, int k, cudaStream_t s) {
     const int64_t nf = int64_t(rows) * k / 4;
-    tq4_dequant_h_k<<<unsigned((nf + 255) / 256), 256, 0, s>>>(w4, sc, out, nf);
+    if ((nf & 1) == 0) {
+        const int64_t np = nf >> 1;
+        tq4_dequant_h_vec8_k<<<unsigned((np + 255) / 256), 256, 0, s>>>(w4, sc, out, np);
+    } else {
+        tq4_dequant_h_k<<<unsigned((nf + 255) / 256), 256, 0, s>>>(w4, sc, out, nf);
+    }
 }
 void tq4_rotate_h(const __nv_bfloat16 * x, __half * xh, int k, int ncols, cudaStream_t s) {
     tq4_rotate_h_k<false><<<dim3((k / 128 + 7) / 8, ncols), 256, 0, s>>>(x, nullptr, nullptr, 0, 0.f, xh, k);
@@ -1073,9 +1487,14 @@ void tq4_norm_rotate_h(const __nv_bfloat16 * x, const float * w, const float * p
 namespace tqg {
 constexpr int BM = 128, BN = 64, BK = 128, LDS = BK + 8;  // LDS: padded row (halves) -> conflict-free fragment loads
 constexpr size_t kSmem = size_t(BM + BN) * LDS * sizeof(__half);
+constexpr size_t kSmemBw = TQLLM_HAS_HW_MMAC ? kSmem : (kSmem + sizeof(tqllm_dumma::SimScratch<4>));
 __device__ __forceinline__ void mma16816(uint32_t (&d)[2], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16acc(d, a[0], a[1], a[2], a[3], b[0], b[1]);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(d[0]), "+r"(d[1]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
 }
 // 8 int8 levels (two expand() words) times the block scale -> 8 halves
 __device__ __forceinline__ uint4 levels_to_h(uint32_t lv0, uint32_t lv1, float s) {
@@ -1201,10 +1620,122 @@ __global__ void __launch_bounds__(256) tq_gemm_h_k(const uint8_t * w, const __ha
         }
 }
 
+// Hygon BW (gfx936) native wave64 DUMMA prefill/feature GEMM: 4 wave64s cover 128x64 via 8 x (16x16x16) v_mmac_f32_16x16x16_f16
+// tiles per wave with direct FP32 accumulation (avoids FP16 sub-block overflow on outlier channels while running at full BW1000 MMAC rate).
+template <int BITS>
+__global__ void __launch_bounds__(256) tq_gemm_bw_k(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y,
+                                                    int rows, int k, int n, int ldy) {
+    using namespace tqg;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __half * Ws = reinterpret_cast<__half *>(smem_raw);            // [BM][LDS]
+    __half * Xs = Ws + BM * LDS;                                   // [BN][LDS]
+    auto * sim = reinterpret_cast<tqllm_dumma::SimScratch<4> *>(smem_raw + kSmem);
+    const int tid = threadIdx.x, wave = tqllm_dumma::wave64_id(), lid = tqllm_dumma::lane64_id();
+    const int r_in = lid & 15, k_grp = lid >> 4;
+    const int m0 = blockIdx.x * BM, n0 = blockIdx.y * BN, nb128 = k / BK;
+    const int wm = (wave >> 1) * 64, wn = (wave & 1) * 32;
+
+    uint4 wraw[2]; uint32_t w3raw[2][3]; uint4 xraw[4]; float wsc[2];
+    auto load = [&](int kb) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int u = tid + 256 * j, r = u >> 2, seg = u & 3, row = m0 + r;
+            wsc[j] = row < rows ? __half2float(sc[size_t(row) * nb128 + kb]) : 0.f;
+            if constexpr (BITS == 4) {
+                wraw[j] = row < rows ? __ldg(reinterpret_cast<const uint4 *>(w + size_t(row) * (k / 2) + size_t(kb) * 64) + seg)
+                                     : make_uint4(0, 0, 0, 0);
+            } else {
+                const int nb = k / 32;
+                const uint32_t * p = reinterpret_cast<const uint32_t *>(w) + size_t(row) * nb * 3 + kb * 4 + seg;
+#pragma unroll
+                for (int pl = 0; pl < 3; ++pl) w3raw[j][pl] = row < rows ? __ldg(p + pl * nb) : 0u;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int u = tid + 256 * j, c = u >> 4, part = u & 15, col = n0 + c;
+            xraw[j] = col < n ? __ldg(reinterpret_cast<const uint4 *>(xh + size_t(col) * k + size_t(kb) * BK) + part)
+                              : make_uint4(0, 0, 0, 0);
+        }
+    };
+    auto store = [&] {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int u = tid + 256 * j, r = u >> 2, seg = u & 3;
+            uint4 words;
+            if constexpr (BITS == 4) words = wraw[j];
+            else words = tq4k::nibbles3(w3raw[j][0], w3raw[j][1], w3raw[j][2]);
+            const uint32_t wd[4] = {words.x, words.y, words.z, words.w};
+            uint4 * dst = reinterpret_cast<uint4 *>(Ws + r * LDS + seg * 32);
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const uint32_t lo = BITS == 4 ? tq4k::expand(wd[q] & 0xFFFFu) : tq4k::expand_b<3>(wd[q] & 0xFFFFu);
+                const uint32_t hi = BITS == 4 ? tq4k::expand(wd[q] >> 16) : tq4k::expand_b<3>(wd[q] >> 16);
+                dst[q] = levels_to_h(lo, hi, wsc[j]);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int u = tid + 256 * j, c = u >> 4, part = u & 15;
+            *reinterpret_cast<uint4 *>(Xs + c * LDS + part * 8) = xraw[j];
+        }
+    };
+
+    tqllm_dumma::AccF32x4 acc[4][2];
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni) acc[mi][ni] = tqllm_dumma::zero_f32x4();
+
+    load(0);
+    for (int kb = 0; kb < nb128; ++kb) {
+        __syncthreads();
+        store();
+        __syncthreads();
+        if (kb + 1 < nb128) load(kb + 1);
+#pragma unroll
+        for (int k16 = 0; k16 < BK; k16 += 16) {
+            tqllm_dumma::FragB16x4 a[4], b[2];
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi) a[mi] = tqllm_dumma::load_a_rowmajor_b16(Ws + (wm + mi * 16) * LDS + k16, LDS);
+#pragma unroll
+            for (int ni = 0; ni < 2; ++ni) b[ni] = tqllm_dumma::load_b_colmajor_b16(Xs + (wn + ni * 16) * LDS + k16, LDS);
+#pragma unroll
+            for (int mi = 0; mi < 4; ++mi)
+#pragma unroll
+                for (int ni = 0; ni < 2; ++ni)
+                    acc[mi][ni] = tqllm_dumma::mmac_f32_16x16x16_f16(a[mi], b[ni], acc[mi][ni], *sim);
+        }
+    }
+
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+        const int row = m0 + wm + mi * 16 + r_in;
+        if (row >= rows) continue;
+#pragma unroll
+        for (int ni = 0; ni < 2; ++ni) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int col = n0 + wn + ni * 16 + k_grp + 4 * i;
+                if (col < n) y[size_t(col) * ldy + row] = __float2bfloat16_rn(acc[mi][ni].x[i]);
+            }
+        }
+    }
+}
+
 template <int BITS>
 static void tq_gemm_h(const uint8_t * w, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n,
                       int ldy, cudaStream_t s) {
     if (k % 128 || n < 1 || rows < 1) throw std::invalid_argument("tq_gemm_h: k % 128 == 0, n >= 1");
+#if TQLLM_USE_BW_PRIMITIVES
+    static bool attr_bw = false;
+    if (!attr_bw) {
+        cudaFuncSetAttribute(tq_gemm_bw_k<BITS>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tqg::kSmemBw));
+        attr_bw = true;
+    }
+    const dim3 grid(unsigned((rows + tqg::BM - 1) / tqg::BM), unsigned((n + tqg::BN - 1) / tqg::BN));
+    tq_gemm_bw_k<BITS><<<grid, 256, tqg::kSmemBw, s>>>(w, sc, xh, y, rows, k, n, ldy);
+#else
     static bool attr = false;
     if (!attr) {
         cudaFuncSetAttribute(tq_gemm_h_k<BITS>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(tqg::kSmem));
@@ -1212,6 +1743,7 @@ static void tq_gemm_h(const uint8_t * w, const __half * sc, const __half * xh, _
     }
     const dim3 grid(unsigned((rows + tqg::BM - 1) / tqg::BM), unsigned((n + tqg::BN - 1) / tqg::BN));
     tq_gemm_h_k<BITS><<<grid, 256, tqg::kSmem, s>>>(w, sc, xh, y, rows, k, n, ldy);
+#endif
 }
 void tq4_gemm_h(const uint8_t * w4, const __half * sc, const __half * xh, __nv_bfloat16 * y, int rows, int k, int n, int ldy,
                 cudaStream_t s) { tq_gemm_h<4>(w4, sc, xh, y, rows, k, n, ldy, s); }

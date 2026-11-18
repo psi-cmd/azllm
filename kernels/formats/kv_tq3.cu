@@ -1,4 +1,5 @@
 // TQ3_0 KV-cache format kernels: writer + FA-style attention (see src/formats/kv_tq3.cpp).
+#include "bw_dumma.cuh"
 #include "common.cuh"
 #include "qwen2_kernels.cuh"
 #include "qwen35_kernels.cuh"
@@ -21,13 +22,22 @@ void attention_merge256(const float * part, __nv_bfloat16 * y, int nsplit, int h
 // Block = NW warps x 16 rows of (query, head) for one KV head and one key split. nsplit == 1: normalised BF16 output;
 // else partials [q][head][split][258] (natural-log max) for attn_gen_merge_k.
 namespace tq3a {
-constexpr int TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8;
+constexpr int TILE = 32, DIM = 256, QS = DIM + 16, KS = DIM + 16, VS = DIM + 8, PS_BW = TILE + 8;
 constexpr float F = 127.f / 1.996684f;
 constexpr uint32_t LUT_LO = 0xF0D1AE81u, LUT_HI = 0x7F512E0Fu;  // bytes: -127 -82 -47 -16 | 15 46 81 127
 // NB K/V tile buffers: 2 = double buffered (decode of the next tile overlaps nothing else in the block, 71 KB at NW 4);
 // 1 = single buffered (45.5 KB at NW 4, so two blocks share an SM and hide each other's latency).
-template <int NW, int NB = 2> constexpr size_t smem() {
+template <int NW, int NB = 2> __host__ __device__ constexpr size_t smem_base() {
     return size_t(NW * 16) * QS + NB * size_t(TILE) * KS + NB * size_t(TILE) * VS * 2 + NB * 8 * TILE * 4 + NW * 16 * 2 * 4;
+}
+template <int NW, int NB = 2> __host__ __device__ constexpr size_t smem() {
+#if TQLLM_USE_BW_PRIMITIVES
+    if constexpr (NW == 4 && NB == 1) {
+        const size_t core = (smem_base<NW, NB>() + 15) / 16 * 16 + size_t(NW * 16) * PS_BW * sizeof(__half);
+        return TQLLM_HAS_HW_MMAC ? core : (core + sizeof(tqllm_dumma::SimScratch<2>));
+    }
+#endif
+    return smem_base<NW, NB>();
 }
 __device__ __forceinline__ uint32_t levels4(const uint32_t (&w)[3], int g) {  // codes 4g .. 4g + 3 -> 4 int8 levels
     const int bit = 12 * g, k = bit / 32, sh = bit % 32;
@@ -387,6 +397,147 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     }
     __syncthreads();
 
+#if TQLLM_USE_BW_PRIMITIVES
+    if constexpr (NW == 4 && NB == 1) {
+        // Hygon BW (gfx936) native wave64 DUMMA path: 128 threads = 2 wave64s x 2 m-tiles (64 rows).
+        // QK runs on v_mmac_i32_16x16x32_i8 (one K=32 block per scale), PV runs on v_mmac_f32_16x16x16_f16.
+        const size_t ps_off = (smem_base<NW, NB>() + 15) / 16 * 16;
+        __half * ps_bw = reinterpret_cast<__half *>(smem_raw + ps_off);  // [64][PS_BW]
+        auto * sim = reinterpret_cast<tqllm_dumma::SimScratch<2> *>(smem_raw + ps_off + size_t(ROWS) * PS_BW * sizeof(__half));
+        const int wave = tqllm_dumma::wave64_id(), lid = tqllm_dumma::lane64_id();
+        const int r_in = lid & 15, k_grp = lid >> 4;
+        const int r_m0 = wave * 32 + r_in, r_m1 = r_m0 + 16;
+        const float q0_s0 = qsc[r_m0 * 2], q0_s1 = qsc[r_m0 * 2 + 1];
+        const float q1_s0 = qsc[r_m1 * 2], q1_s1 = qsc[r_m1 * 2 + 1];
+        const int lim_0 = qlim(min(r0 + r_m0, rows - 1) / g), lim_1 = qlim(min(r0 + r_m1, rows - 1) / g);
+        const float sl2_bw = scale * 1.4426950408889634f;
+        tqllm_dumma::AccF32x4 o_bw[2][16];
+#pragma unroll
+        for (int mt_i = 0; mt_i < 2; ++mt_i)
+#pragma unroll
+            for (int np = 0; np < 16; ++np) o_bw[mt_i][np] = tqllm_dumma::zero_f32x4();
+        float m_bw[2] = {-CUDART_INF_F, -CUDART_INF_F}, l_bw[2] = {0.f, 0.f};
+
+        for (int u = 0; u < ntile; ++u) {
+            const int t0 = kbeg + u * stride;
+            const int8_t * kt = k8;
+            const __half * vt = vh;
+            float s_bw[2][2][4] = {};
+#pragma unroll
+            for (int b = 0; b < 8; ++b) {
+                const tqllm_dumma::FragI8x8 qa0 = tqllm_dumma::load_a_rowmajor_i8(q8 + (wave * 32 + 0) * QS + b * 32, QS);
+                const tqllm_dumma::FragI8x8 qa1 = tqllm_dumma::load_a_rowmajor_i8(q8 + (wave * 32 + 16) * QS + b * 32, QS);
+                const tqllm_dumma::FragI8x8 kb0 = tqllm_dumma::load_b_colmajor_i8(kt + 0 * KS + b * 32, KS);
+                const tqllm_dumma::FragI8x8 kb1 = tqllm_dumma::load_b_colmajor_i8(kt + 16 * KS + b * 32, KS);
+                const auto c00 = tqllm_dumma::mmac_i32_16x16x32_i8(qa0, kb0, tqllm_dumma::zero_i32x4(), *sim);
+                const auto c01 = tqllm_dumma::mmac_i32_16x16x32_i8(qa0, kb1, tqllm_dumma::zero_i32x4(), *sim);
+                const auto c10 = tqllm_dumma::mmac_i32_16x16x32_i8(qa1, kb0, tqllm_dumma::zero_i32x4(), *sim);
+                const auto c11 = tqllm_dumma::mmac_i32_16x16x32_i8(qa1, kb1, tqllm_dumma::zero_i32x4(), *sim);
+                const float sq0 = b < 4 ? q0_s0 : q0_s1, sq1 = b < 4 ? q1_s0 : q1_s1;
+                const float * ks_b = ksf + b * TILE;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float k_0 = ks_b[k_grp + 4 * i], k_1 = ks_b[16 + k_grp + 4 * i];
+                    s_bw[0][0][i] += sq0 * float(c00.x[i]) * k_0;
+                    s_bw[0][1][i] += sq0 * float(c01.x[i]) * k_1;
+                    s_bw[1][0][i] += sq1 * float(c10.x[i]) * k_0;
+                    s_bw[1][1][i] += sq1 * float(c11.x[i]) * k_1;
+                }
+            }
+
+            const bool msk = t0 + TILE > mask_from;
+#pragma unroll
+            for (int mt_i = 0; mt_i < 2; ++mt_i) {
+                const int lim_m = mt_i == 0 ? lim_0 : lim_1;
+                const int r_loc = wave * 32 + mt_i * 16 + r_in;
+                float mx_loc = -CUDART_INF_F;
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int key = t0 + nt * 16 + k_grp + 4 * i;
+                        float x = s_bw[mt_i][nt][i] * sl2_bw;
+                        if (kbias && key < kend) x += kbias[int64_t(key) * kvheads + kh] * 1.4426950408889634f;
+                        if (key >= kend || (msk && key >= lim_m)) x = -CUDART_INF_F;
+                        s_bw[mt_i][nt][i] = x;
+                        mx_loc = fmaxf(mx_loc, x);
+                    }
+                const float mx = tqllm_dumma::row_group4_max(mx_loc, *sim);
+                const float mn = fmaxf(m_bw[mt_i], mx);
+                const float msafe = mn > -CUDART_INF_F ? mn : 0.f;
+                const float al = m_bw[mt_i] > -CUDART_INF_F ? exp2f(m_bw[mt_i] - msafe) : 0.f;
+                m_bw[mt_i] = mn;
+#pragma unroll
+                for (int np = 0; np < 16; ++np)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) o_bw[mt_i][np].x[i] *= al;
+
+                float s_loc = 0.f;
+                __half * prow = ps_bw + r_loc * PS_BW;
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float pv = s_bw[mt_i][nt][i] > -CUDART_INF_F ? exp2f(s_bw[mt_i][nt][i] - msafe) : 0.f;
+                        s_loc += pv;
+                        prow[nt * 16 + k_grp + 4 * i] = __float2half_rn(pv);
+                    }
+                l_bw[mt_i] = l_bw[mt_i] * al + s_loc;
+            }
+            tqllm_dumma::wave64_barrier();
+
+#pragma unroll
+            for (int kk = 0; kk < 2; ++kk) {
+                const tqllm_dumma::FragB16x4 pf0 = tqllm_dumma::load_a_rowmajor_b16(ps_bw + (wave * 32 + 0) * PS_BW + kk * 16, PS_BW);
+                const tqllm_dumma::FragB16x4 pf1 = tqllm_dumma::load_a_rowmajor_b16(ps_bw + (wave * 32 + 16) * PS_BW + kk * 16, PS_BW);
+#pragma unroll
+                for (int np = 0; np < 16; ++np) {
+                    const tqllm_dumma::FragB16x4 vf = tqllm_dumma::load_b_rowmajor_b16(vt + kk * 16 * VS + np * 16, VS);
+                    o_bw[0][np] = tqllm_dumma::mmac_f32_16x16x16_f16(pf0, vf, o_bw[0][np], *sim);
+                    o_bw[1][np] = tqllm_dumma::mmac_f32_16x16x16_f16(pf1, vf, o_bw[1][np], *sim);
+                }
+            }
+
+            if (u + 1 < ntile) {
+                __syncthreads();
+                store(0);
+            }
+            if (u + 2 < ntile) load(t0 + 2 * stride);
+            __syncthreads();
+        }
+
+        l_bw[0] = tqllm_dumma::row_group4_sum(l_bw[0], *sim);
+        l_bw[1] = tqllm_dumma::row_group4_sum(l_bw[1], *sim);
+        const int ps = pstride ? pstride : cstride ? cstride : nsplit;
+        constexpr float LN2 = 0.6931471805599453f;
+#pragma unroll
+        for (int mt_i = 0; mt_i < 2; ++mt_i) {
+            const int ga_m = r0 + wave * 32 + mt_i * 16 + r_in;
+            if (ga_m >= rows) continue;
+            const int64_t hm = int64_t(ga_m / g) * heads + kh * g + ga_m % g;
+            if (nsplit == 1 && !pstride && !cstride) {
+                const float inv_l = l_bw[mt_i] > 0.f ? 1.f / l_bw[mt_i] : 0.f;
+                __nv_bfloat16 * ym = y + hm * DIM;
+#pragma unroll
+                for (int np = 0; np < 16; ++np)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) ym[np * 16 + k_grp + 4 * i] = __float2bfloat16_rn(o_bw[mt_i][np].x[i] * inv_l);
+            } else {
+                float * pm = part + (hm * ps + split + poff) * (DIM + 2);
+#pragma unroll
+                for (int np = 0; np < 16; ++np)
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) pm[np * 16 + k_grp + 4 * i] = o_bw[mt_i][np].x[i];
+                if (k_grp == 0) {
+                    pm[DIM] = m_bw[mt_i] * LN2;
+                    pm[DIM + 1] = l_bw[mt_i];
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     const int ra = warp * 16 + gid, rb = ra + 8;
     const float qa0 = qsc[ra * 2], qa1 = qsc[ra * 2 + 1], qb0 = qsc[rb * 2], qb1 = qsc[rb * 2 + 1];
     const int lim_a = qlim(min(r0 + ra, rows - 1) / g), lim_b = qlim(min(r0 + rb, rows - 1) / g);
@@ -459,7 +610,7 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
             pf[nt / 2][(nt & 1) * 2 + 1] = pack_h2(p2, p3);
         }
         l_a = l_a * al + sa, l_b = l_b * bl + sb;
-        if (__any_sync(0xffffffffu, al != 1.f || bl != 1.f))
+        if (tqllm_bw::any_sync32(0xffffffffu, al != 1.f || bl != 1.f))
 #pragma unroll
             for (int j = 0; j < 32; ++j) o[j][0] *= al, o[j][1] *= al, o[j][2] *= bl, o[j][3] *= bl;
         const __half * vrow = vt + ((lane / 8) & 1) * 8 * VS + (lane % 8) * VS + (lane / 16) * 8;
@@ -701,7 +852,7 @@ __global__ void __launch_bounds__(64 << KB) cache_write_tcq(const __nv_bfloat16 
     }
     if (sid < 32) {
         float v = cost[sid];
-        for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o, 32);
         if (sid == 0) cost[0] = v;
     }
     __syncthreads();
@@ -763,8 +914,8 @@ __global__ void __launch_bounds__(64 << KB) cache_write_tcq(const __nv_bfloat16 
         float best = sid < NWARP ? wmc[sid] : 3.4028234663852886e38f;
         int bi = sid < NWARP ? wmi[sid] : 0;
         for (int o = 16; o; o >>= 1) {
-            const float oc = __shfl_down_sync(0xffffffffu, best, o);
-            const int oi = __shfl_down_sync(0xffffffffu, bi, o);
+            const float oc = __shfl_down_sync(0xffffffffu, best, o, 32);
+            const int oi = __shfl_down_sync(0xffffffffu, bi, o, 32);
             if (oc < best) best = oc, bi = oi;
         }
         if (sid == 0) init_state = bi;
@@ -795,7 +946,7 @@ __global__ void __launch_bounds__(64 << KB) cache_write_tcq(const __nv_bfloat16 
     }
     if (sid < 32) {
         float v = cost[sid];
-        for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+        for (int o = 16; o; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o, 32);
         if (sid == 0) cost[0] = v;
     }
     __syncthreads();
@@ -856,7 +1007,7 @@ static void compact_partial(const __nv_bfloat16 * q, const KvCompactSeg & c, flo
     float * dst = splits > 1 ? c.split_buf : part;
     const int cst = splits > 1 ? splits : ps, off = splits > 1 ? 0 : slot;
     const auto * k = reinterpret_cast<const uint8_t *>(c.k), * v = reinterpret_cast<const uint8_t *>(c.v);
-    if (mq) tq3_launch<4, kvc::Q8, kvc::Q8, 1>(q, k, v, nullptr, dst, c.n, nq, h, kh, scale, splits, s, nullptr, 0, 0, nullptr, cst, c.bias, 1, off);
+    if (mq || TQLLM_USE_BW_PRIMITIVES) tq3_launch<4, kvc::Q8, kvc::Q8, 1>(q, k, v, nullptr, dst, c.n, nq, h, kh, scale, splits, s, nullptr, 0, 0, nullptr, cst, c.bias, 1, off);
     else tq3_launch<8, kvc::Q8, kvc::Q8>(q, k, v, nullptr, dst, c.n, nq, h, kh, scale, splits, s, nullptr, 0, 0, nullptr, cst, c.bias, 1, off);
     if (splits > 1) attn_compact_merge_k<<<nq * h, 256, 0, s>>>(c.split_buf, splits, part, ps, slot);
 }
@@ -897,7 +1048,7 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
     if (cs) {  // cache partials + one stand-in partial (slot ns), merged, then the inverse rotation
         const bool mq = (h / kh) * nq <= 64;
         const int ns = mq ? nsplit : 1;
-        if (mq) tq3_launch<4, KC, VC, 1>(q, k, v, y, part, dseq0, nq, h, kh, scale, ns, s, nullptr, 0, 0, d0, ns + 1);
+        if (mq || TQLLM_USE_BW_PRIMITIVES) tq3_launch<4, KC, VC, 1>(q, k, v, y, part, dseq0, nq, h, kh, scale, ns, s, nullptr, 0, 0, d0, ns + 1);
         else tq3_launch<8, KC, VC>(q, k, v, y, part, dseq0, nq, h, kh, scale, ns, s, nullptr, 0, 0, d0, ns + 1);
         compact_partial(q, *cs, part, nq, h, kh, scale, ns + 1, ns, s);
         attention_merge256(part, y, ns + 1, h, nq, s);
@@ -907,7 +1058,11 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
     if ((h / kh) * nq <= 64) {
         tq3_launch<4, KC, VC, 1>(q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, s);
     }
+#if TQLLM_USE_BW_PRIMITIVES
+    else tq3_launch<4, KC, VC, 1>(q, k, v, y, part, dseq0, nq, h, kh, scale, 1, s);
+#else
     else tq3_launch<8, KC, VC>(q, k, v, y, part, dseq0, nq, h, kh, scale, 1, s);
+#endif
 }
 
 void attention_kv_split(KvCodec kcodec, KvCodec vcodec, const __nv_bfloat16 * q, const void * kc, const void * vc,
@@ -1030,7 +1185,7 @@ __global__ void cache_write_multi_qn(const __nv_bfloat16 * x0, int ts, uint8_t *
     const float d = __half2float(dh), id = d != 0.f ? 1.f / d : 0.f;
     if constexpr (Q4) {
         const int qv = min(15, max(0, __float2int_rn(v * id) + 8));
-        const int hi = __shfl_down_sync(0xffffffffu, qv, 1);
+        const int hi = __shfl_down_sync(0xffffffffu, qv, 1, 32);
         if (!(lane & 1)) rec[16 + 16 * blk + lane / 2] = uint8_t(qv | (hi << 4));
     } else {
         rec[16 + 32 * blk + lane] = uint8_t(int8_t(max(-127, min(127, __float2int_rn(v * id)))));

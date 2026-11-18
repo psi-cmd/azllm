@@ -1,5 +1,6 @@
 #pragma once
 // Device helpers shared by kernels/formats/*.cu (tensor-core MMA wrappers, packed half2 math, ldmatrix).
+#include "bw_primitives.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
@@ -10,28 +11,44 @@ namespace tqllm_dev {
 
 __device__ __forceinline__ void mma_f16(float * c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile(
         "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ uint32_t hmul2u(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hmul2u(a, b);
+#else
     uint32_t r;
     asm("mul.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
     return r;
+#endif
 }
 
 __device__ __forceinline__ uint32_t hadd2u(uint32_t a, uint32_t b) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hadd2u(a, b);
+#else
     uint32_t r;
     asm("add.rn.f16x2 %0, %1, %2;\n" : "=r"(r) : "r"(a), "r"(b));
     return r;
+#endif
 }
 
 __device__ __forceinline__ uint32_t hfma2u(uint32_t a, uint32_t b, uint32_t c) {
+#if TQLLM_USE_BW_PRIMITIVES
+    return tqllm_bw::hfma2u(a, b, c);
+#else
     uint32_t r;
     asm("fma.rn.f16x2 %0, %1, %2, %3;\n" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
+#endif
 }
 
 __device__ __forceinline__ uint32_t pack_h2(float x, float y) {
@@ -41,26 +58,42 @@ __device__ __forceinline__ uint32_t pack_h2(float x, float y) {
 
 __device__ __forceinline__ void mma_f16acc(uint32_t (&c)[2], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
                                            uint32_t b0, uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_f16acc(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                  : "+r"(c[0]), "+r"(c[1])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void mma_s8(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                        uint32_t b1) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::mma_s8(c, a0, a1, a2, a3, b0, b1);
+#else
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void * p) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::ldsm_x4(r, p);
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
+#endif
 }
 
 __device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void * p) {
+#if TQLLM_USE_BW_PRIMITIVES
+    tqllm_bw::ldsm_x4_t(r, p);
+#else
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(uint32_t(__cvta_generic_to_shared(p))));
+#endif
 }
 
 // Two-part (tree) verify attention: a query at position qpos takes keys [0, split) from the cache kernel and [split, qpos]
