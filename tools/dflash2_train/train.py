@@ -126,6 +126,13 @@ def build_draft(args, target_cfg, torch):
     d = DRAFT_DEFAULTS
     if args.init:
         cfg = Qwen3Config.from_pretrained(args.init)
+        # Published drafters are saved by transformers 5.x, which keeps RoPE under `rope_parameters`; 4.x reads only
+        # the top-level `rope_theta` and silently falls back to 10000 (the drafter is trained and served at 1e7), so
+        # warm starts trained a different positional encoding than azllm serves. Take the 5.x value when present.
+        rp = getattr(cfg, "rope_parameters", None) or {}
+        if isinstance(rp, dict) and rp.get("rope_theta") and float(getattr(cfg, "rope_theta", 0) or 0) != float(rp["rope_theta"]):
+            print(f"rope_theta {getattr(cfg, 'rope_theta', None)} -> {rp['rope_theta']} (from rope_parameters)", flush=True)
+            cfg.rope_theta = float(rp["rope_theta"])
     else:
         L = args.draft_layers
         cfg = Qwen3Config(
@@ -167,6 +174,10 @@ def build_draft(args, target_cfg, torch):
         }
     cfg._attn_implementation = args.attention_backend
     model = Qwen3DFlash2DraftModel(cfg)
+    theta = 1.0 / float(model.rotary_emb.inv_freq[1]) ** (cfg.head_dim / 2)
+    if abs(theta / 1e7 - 1) > 1e-3:
+        raise SystemExit(f"draft RoPE theta {theta:.0f} != 1e7: the drafter would train a different positional encoding "
+                         "than azllm serves")
     if args.init:
         from safetensors.torch import load_file
 
