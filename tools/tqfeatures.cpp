@@ -13,10 +13,15 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <array>
+#include <condition_variable>
+#include <exception>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -37,6 +42,96 @@ void write_frame(uint32_t P, uint32_t nf, uint32_t H, const std::vector<uint16_t
     write_all(hdr, sizeof hdr);
     if (P) write_all(feats.data(), feats.size() * sizeof(uint16_t));
 }
+
+// The producer and writer own separate buffers, so large frames can be drained
+// to the pipe while the GPU computes the next request. At most two frames may
+// be outstanding: the third waits for the first write to finish.
+class FrameWriter {
+public:
+    struct Frame {
+        uint32_t p = 0, nf = 0, hidden = 0;
+        std::vector<uint16_t> data;
+    };
+
+    FrameWriter() : writer_([this] { run(); }) {}
+    FrameWriter(const FrameWriter &) = delete;
+    FrameWriter & operator=(const FrameWriter &) = delete;
+
+    Frame & acquire() {
+        std::unique_lock lock(mu_);
+        cv_.wait(lock, [&] { return queued_ - sent_ < frames_.size() || error_; });
+        if (error_) std::rethrow_exception(error_);
+        return frames_[queued_ % frames_.size()];
+    }
+
+    void submit() {
+        {
+            std::lock_guard lock(mu_);
+            if (error_) std::rethrow_exception(error_);
+            ++queued_;
+        }
+        cv_.notify_all();
+    }
+
+    void finish() {
+        {
+            std::lock_guard lock(mu_);
+            closing_ = true;
+        }
+        cv_.notify_all();
+        if (writer_.joinable()) writer_.join();
+        if (error_) std::rethrow_exception(error_);
+    }
+
+    ~FrameWriter() {
+        if (writer_.joinable()) {
+            {
+                std::lock_guard lock(mu_);
+                closing_ = true;
+            }
+            cv_.notify_all();
+            writer_.join();
+        }
+    }
+
+private:
+    void run() {
+        while (true) {
+            size_t index;
+            {
+                std::unique_lock lock(mu_);
+                cv_.wait(lock, [&] { return sent_ < queued_ || closing_; });
+                if (sent_ == queued_) return;
+                index = sent_ % frames_.size();
+            }
+            try {
+                const Frame & frame = frames_[index];
+                write_frame(frame.p, frame.nf, frame.hidden, frame.data);
+            } catch (...) {
+                {
+                    std::lock_guard lock(mu_);
+                    error_ = std::current_exception();
+                    closing_ = true;
+                }
+                cv_.notify_all();
+                return;
+            }
+            {
+                std::lock_guard lock(mu_);
+                ++sent_;
+            }
+            cv_.notify_all();
+        }
+    }
+
+    std::array<Frame, 2> frames_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    size_t queued_ = 0, sent_ = 0;
+    bool closing_ = false;
+    std::exception_ptr error_;
+    std::thread writer_;
+};
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -72,24 +167,29 @@ int main(int argc, char ** argv) {
 
         std::string line;
         std::vector<uint32_t> ids;
-        std::vector<uint16_t> feats;
+        FrameWriter frames;
         while (std::getline(std::cin, line)) {
             ids.clear();
             std::istringstream in(line);
             for (uint64_t v; in >> v;) ids.push_back(uint32_t(v));
             if (ids.empty()) continue;
+            auto & frame = frames.acquire();
             try {
                 for (auto t : ids)
                     if (t >= V) throw std::invalid_argument("token id " + std::to_string(t) + " >= vocab");
                 if (ids.size() + 1 > ctx)
                     throw std::invalid_argument(std::to_string(ids.size()) + " tokens exceed context " + std::to_string(ctx));
-                const int nf = model.drafter_features(ids, feats);
-                write_frame(uint32_t(ids.size()), uint32_t(nf), H, feats);
+                const int nf = model.drafter_features(ids, frame.data);
+                frame.p = uint32_t(ids.size());
+                frame.nf = uint32_t(nf);
+                frame.hidden = H;
             } catch (const std::invalid_argument & e) {
                 std::cerr << "tqfeatures: request rejected: " << e.what() << '\n';
-                write_frame(0, 0, 0, feats);
+                frame.p = frame.nf = frame.hidden = 0;
             }
+            frames.submit();
         }
+        frames.finish();
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "tqfeatures: " << e.what() << '\n';

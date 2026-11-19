@@ -14,6 +14,7 @@ import queue
 import struct
 import subprocess
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Iterator
 
@@ -29,14 +30,17 @@ class Sample:
     hidden: np.ndarray  # uint16 (bf16 bits) [P, nf * H]
 
 
-def _read_exact(f, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = f.read(n - len(buf))
-        if not chunk:
+def _read_exact(f, n: int) -> bytearray:
+    """Read a frame without reallocating chunks or copying the complete payload."""
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    while pos < n:
+        count = f.readinto(view[pos:])
+        if not count:
             raise EOFError("tqfeatures closed its output")
-        buf += chunk
-    return bytes(buf)
+        pos += count
+    return buf
 
 
 class FeatureServer:
@@ -51,11 +55,13 @@ class FeatureServer:
             bufsize=0,
         )
 
-    def features(self, ids: Iterable[int]) -> np.ndarray | None:
-        """[P, nf * H] uint16 BF16 bits, or None if the server rejected the request."""
+    def send(self, ids: Iterable[int]) -> None:
+        """Submit a request; replies must be read in the same order."""
         line = " ".join(str(int(t)) for t in ids) + "\n"
         self.proc.stdin.write(line.encode())
-        self.proc.stdin.flush()
+
+    def receive(self) -> np.ndarray | None:
+        """Read the oldest response: [P, nf * H] uint16 BF16 bits, or None."""
         magic, P, nf, H = struct.unpack("<4I", _read_exact(self.proc.stdout, 16))
         if magic != MAGIC:
             raise RuntimeError(f"tqfeatures: bad frame magic {magic:#x}")
@@ -64,15 +70,28 @@ class FeatureServer:
         raw = _read_exact(self.proc.stdout, P * nf * H * 2)
         return np.frombuffer(raw, dtype=np.uint16).reshape(P, nf * H)
 
+    def features(self, ids: Iterable[int]) -> np.ndarray | None:
+        self.send(ids)
+        return self.receive()
+
     def close(self) -> None:
-        if self.proc.poll() is None:
-            self.proc.stdin.close()
-            try:
-                self.proc.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        if self.log:
-            self.log.close()
+        try:
+            if self.proc.stdin and not self.proc.stdin.closed:
+                try:
+                    self.proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if self.proc.poll() is None:
+                try:
+                    self.proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+        finally:
+            if self.proc.stdout:
+                self.proc.stdout.close()
+            if self.log:
+                self.log.close()
 
 
 class FeatureCache:
@@ -132,14 +151,34 @@ class FeaturePool:
                     todo.put(stop)
 
         def worker(srv: FeatureServer):
+            # Two outstanding requests let the target compute the next sequence while its
+            # writer thread streams the previous frame. More outstanding requests can
+            # deadlock if both stdin and stdout pipe buffers fill simultaneously.
+            pending = deque()
+            finished = False
             try:
-                while (rec := todo.get()) is not stop:
-                    ids, mask = rec
-                    hid = self.cache.get(ids) if self.cache else None
-                    if hid is None:
-                        hid = srv.features(ids)
-                        if hid is not None and self.cache:
-                            self.cache.put(ids, hid)
+                while not finished or pending:
+                    while not finished and len(pending) < 2:
+                        try:
+                            rec = todo.get(block=not pending)
+                        except queue.Empty:
+                            break
+                        if rec is stop:
+                            finished = True
+                            break
+                        ids, mask = rec
+                        hid = self.cache.get(ids) if self.cache else None
+                        if hid is not None:
+                            done.put(Sample(ids, mask, hid))
+                            continue
+                        srv.send(ids)
+                        pending.append((ids, mask))
+                    if not pending:
+                        continue
+                    ids, mask = pending.popleft()
+                    hid = srv.receive()
+                    if hid is not None and self.cache:
+                        self.cache.put(ids, hid)
                     if hid is not None:
                         done.put(Sample(ids, mask, hid))
             except BaseException as e:  # surface in the consumer thread

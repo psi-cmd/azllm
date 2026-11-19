@@ -18,6 +18,7 @@ import shutil
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -58,11 +59,14 @@ def main() -> int:
     ap.add_argument("--feature-args", default="")
     ap.add_argument("--lengths", default="512,1024,2048,3000")
     ap.add_argument("--per-length", type=int, default=4)
+    ap.add_argument("--pipeline-depth", type=int, choices=(1, 2), default=1,
+                    help="number of in-flight frames per server (2 overlaps compute and pipe writes)")
     ap.add_argument("--write-dirs", default="", help="comma-separated dirs to time cache writes into (wiped)")
     ap.add_argument("--log-dir", default=".")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
+    Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     lengths = [int(x) for x in args.lengths.split(",")]
     reqs = make_requests(token_pool(args.data), lengths, args.per_length, args.seed)
     cmd = [args.features_bin, "--model", args.target_gguf, "-md", args.drafter_gguf,
@@ -81,22 +85,34 @@ def main() -> int:
     todo = list(reqs)
     timings: list[tuple[int, float]] = []
     frames: list[tuple[np.ndarray, np.ndarray]] = []
+    errors: list[Exception] = []
 
     def worker(srv: FeatureServer):
-        while True:
+        pending = deque()
+        try:
+            while True:
+                while len(pending) < args.pipeline_depth:
+                    with lock:
+                        ids = todo.pop() if todo else None
+                    if ids is None:
+                        break
+                    start = time.perf_counter()
+                    srv.send(ids)
+                    pending.append((ids, start))
+                if not pending:
+                    break
+                ids, start = pending.popleft()
+                hid = srv.receive()
+                dt = time.perf_counter() - start
+                if hid is None:
+                    raise RuntimeError(f"server rejected a {len(ids)}-token request")
+                with lock:
+                    timings.append((len(ids), dt))
+                    if len(frames) < 8:
+                        frames.append((ids, hid.copy()))
+        except Exception as exc:
             with lock:
-                if not todo:
-                    return
-                ids = todo.pop()
-            s = time.perf_counter()
-            hid = srv.features(ids)
-            dt = time.perf_counter() - s
-            if hid is None:
-                raise RuntimeError(f"server rejected a {len(ids)}-token request")
-            with lock:
-                timings.append((len(ids), dt))
-                if len(frames) < 8:
-                    frames.append((ids, hid.copy()))
+                errors.append(exc)
 
     t1 = time.time()
     threads = [threading.Thread(target=worker, args=(s,)) for s in servers]
@@ -107,14 +123,19 @@ def main() -> int:
     wall = time.time() - t1
     for s in servers:
         s.close()
+    if errors:
+        raise errors[0]
+    if not timings:
+        raise RuntimeError("feature benchmark returned no frames")
 
     P = np.array([p for p, _ in timings], dtype=np.float64)
     T = np.array([t for _, t in timings])
     b, a = np.polyfit(P, T, 1) if len(set(P)) > 1 else (T.mean() / P.mean(), 0.0)
     tok = int(P.sum())
-    print(f"config: servers={args.servers} feature_args={args.feature_args!r} context={args.feature_context}")
+    print(f"config: servers={args.servers} feature_args={args.feature_args!r} "
+          f"context={args.feature_context} pipeline_depth={args.pipeline_depth}")
     print(f"load+warmup {load_s:.1f}s | {len(timings)} requests, {tok} tokens in {wall:.1f}s "
-          f"-> {tok / wall:.0f} tok/s total, {tok / T.sum():.0f} tok/s per server")
+          f"-> {tok / wall:.0f} tok/s total, {tok / wall / args.servers:.0f} tok/s per server")
     print(f"per-request fit: t = {a * 1e3:.0f} ms + {b * 1e3:.3f} ms/token")
     for L in lengths:
         m = P == L
