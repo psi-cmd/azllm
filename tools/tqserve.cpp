@@ -115,7 +115,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 void usage() {
     std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--guard on|off] [--guard-rescues N] [--guard-window N] [--guard-scan N] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
-                 "[--repeat-limit N (default 256, 0 off)] [--top-p F (default 0.95; 1 = sample the whole candidate set)] [--top-k N (default 0 = all; the sampler scores 16 candidates, so >16 has no effect)] [--list-kv] [--list-flags]\n"
+                 "[--repeat-limit N (default 256, 0 off)] [--temp F (default 0 = greedy, for requests that send none)] [--top-p F (default 0.95; 1 = sample the whole candidate set)] [--top-k N (default 0 = all; the sampler scores 16 candidates, so >16 has no effect)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
               << "  GET /admin/slots: allocated / active limit / busy / queued; POST /admin/slots {\"slots\": k}: live parallelism (np > 1)\n"
                  "  --np N: serve N requests concurrently (batched verify; drafts with -md, else one token per step); --context is split evenly across them\n";
@@ -222,6 +222,11 @@ int main(int argc, char ** argv) {
                 const double p = std::stod(value());
                 if (!(p > 0.0 && p <= 1.0)) throw std::invalid_argument("--top-p must be in (0, 1]");
                 tqserve::serve_options().top_p = float(p);
+            }
+            else if (arg == "--temp" || arg == "--temperature") {
+                const double t = std::stod(value());
+                if (!(t >= 0.0 && t <= 2.0)) throw std::invalid_argument("--temp must be in [0, 2]");
+                tqserve::serve_options().temperature = float(t);
             }
             else if (arg == "--top-k") { const int k = std::stoi(value()); tqserve::serve_options().top_k = k < 0 ? 0 : k; }
             else if (arg == "--np") np = static_cast<uint32_t>(std::stoul(value()));

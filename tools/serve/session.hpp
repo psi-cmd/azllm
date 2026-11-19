@@ -34,6 +34,7 @@ struct ServeOptions {
     float top_p = 0.95f;        // --top-p F: nucleus over the scored candidates, the Qwen3.8 card value for both
                                 // modes; 1.0 = the old behaviour (sample the whole candidate set)
     int top_k = 0;              // --top-k N: 0 = all candidates the model scores (16); above 16 has no effect
+    float temperature = 0.f;    // --temp F: for requests that send no temperature; 0 = greedy
 };
 inline ServeOptions & serve_options() {  // set by tqserve's main before the first request
     static ServeOptions o;
@@ -46,6 +47,7 @@ inline int draft_length(bool native_mtp = false) {
 inline uint32_t repeat_limit() { return serve_options().repeat_limit; }
 inline float top_p_default() { return serve_options().top_p; }
 inline int top_k_default() { return serve_options().top_k; }
+inline float temperature_default() { return serve_options().temperature; }
 
 // Degenerate output guard. Under memory pressure the sampler can pin on one token (">" ...) until max_tokens, which
 // looks like a hang from outside. A run of repeat_limit() identical ids ends the request as "length" and is logged.
@@ -102,9 +104,9 @@ struct ChatRequest {
     bool budget_set = false;
     std::string budget_message;
     bool message_set = false;
-    float temperature = 0.f, top_p = top_p_default();  // temperature 0 = greedy (TQLLM samples from the exact
-    int top_k = top_k_default();                       // top-16 logits). Both default to the server's --top-p /
-                                                       // --top-k; a request that sends either one still wins.
+    float temperature = temperature_default(), top_p = top_p_default();  // temperature 0 = greedy (TQLLM samples
+    int top_k = top_k_default();  // from the exact top-16 logits). All three default to the server's --temp / --top-p /
+                                  // --top-k; a request that sends one still wins.
     uint64_t seed = 0;
     bool stream = false;  // SSE (chat.completion.chunk / text_completion chunks, final usage + timings, [DONE])
     std::vector<std::string> images;  // image_url parts in prompt order (data: URIs)
