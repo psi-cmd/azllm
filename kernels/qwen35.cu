@@ -1,5 +1,8 @@
 #include <cstdlib>
 #include "qwen35_kernels.cuh"
+#ifdef TQLLM_BW
+#include "gdn_chunk_bw.cuh"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -883,6 +886,17 @@ void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const
     if (par && n > 16) throw std::invalid_argument("gdn_multi: tree mode needs n <= 16");
     if (rp.smid && (!par || n > 16)) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode, n <= 16");
     if (dv % GDN_CPB) throw std::invalid_argument("gdn_multi: dv % columns per block");
+#ifdef TQLLM_BW
+    // Opt-in until the matrix-chunk path has passed numerical and speed gates
+    // on actual gfx936. Decode and speculative trees always use the original.
+    if (!par && n >= 16 && dv % gdn_bw::V == 0 && vheads % kheads == 0) {
+        const char * setting = std::getenv("TQLLM_GDN_CHUNK_MIN");
+        if (setting && n >= std::max(16, std::atoi(setting)) &&
+            gdn_bw::launch(qkv, n, a0, b0, ab_stride, neg_a, dt_bias,
+                           in, out, y, kheads, vheads, dv, tiled, s))
+            return;
+    }
+#endif
     gdn_multi_k<128><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, in, out, y, kheads,
                                                           vheads, dv, tiled, par, rp);
 }
