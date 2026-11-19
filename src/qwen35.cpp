@@ -15,6 +15,7 @@
 #include "graph_capture.hpp"
 #include "graph_lru.hpp"
 #include "tree_columns.hpp"
+#include "tree_sample.hpp"
 #include "dev_alloc.cuh"
 #include "fp8_gemm.cuh"
 #include "int8_gemm.cuh"
@@ -1950,6 +1951,10 @@ private:
     std::vector<uint32_t> h_sid;
     std::vector<float> h_slg;
     bool sampling() const { return samp.temperature > 0.f; }
+    static bool tree_greedy_only() {  // TQLLM_DEBUG=tree_greedy_only: sampled requests verify a chain (the old behaviour)
+        static const bool on = tqllm::debug_on("tree_greedy_only");
+        return on;
+    }
     bool batch_topk = false;  // batched verify with at least one sampling slot: every column returns its top-16
     bool want_topk() const { return batch_topk || sampling(); }
     Buf dsub_ids, dsub_w, dsub_s;  // optional DFlash2 draft-vocabulary head (4-bit) + row -> token id
@@ -3778,7 +3783,7 @@ public:
         }
         // no drafter: one verified token per step; a tree may spend up to NVER - 1 nodes (depth still <= block - 1)
         if (D <= 0 && dfl_on) D = dfl.dspark ? 3 : 7;  // GB10 MiniCPM-V-4.7 + DSpark chain: 3 -> 147.9 / 86.6 / 163.6, 7 -> 140.2 / 66.1 / 149.2
-        D = dfl_on ? std::min(D, tree_mode && !sampling() ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
+        D = dfl_on ? std::min(D, tree_mode && (!sampling() || !tree_greedy_only()) ? NVER - 1 : dfl.block - 1) : use_mtp ? D : 0;
         const int reserve = use_mtp ? D + 1 : dfl.block + 1;
         if (P == 0 || count == 0 || uint64_t(P) + count + reserve > context_)
             throw std::runtime_error("request exceeds context capacity");
@@ -4345,7 +4350,8 @@ public:
         auto now = [] { return std::chrono::steady_clock::now(); };
         auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
         static const bool tree_chain = tqllm::debug_on("tree_chain");  // tree kernels, chain drafts (draft-independence check)
-        if (tree_mode && !sampling() && D > 1 && !tree_chain) {  // token-tree step (greedy)
+        // sampled trees: exact (sampling without replacement down the tree), TQLLM_DEBUG=tree_greedy_only: chain
+        if (tree_mode && (!sampling() || !tree_greedy_only()) && D > 1 && !tree_chain) {  // token-tree step
             // draft -> tree -> verify queued back to back on the device; one host sync after the verify
             const auto t0 = now();
             uint32_t lk[NVER];
@@ -4379,6 +4385,10 @@ public:
             in.resize(size_t(n));
             ck(cudaMemcpyAsync(in.data(), v_tokens.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
             ck(cudaMemcpyAsync(tpar.data(), d_tpar.p, size_t(n) * 4, cudaMemcpyDeviceToHost, stream));
+            if (sampling()) {  // every node's target top-16 (the head wrote them for the n columns)
+                ck(cudaMemcpyAsync(h_sid.data(), s_id.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
+                ck(cudaMemcpyAsync(h_slg.data(), s_lg.p, size_t(n) * 16 * 4, cudaMemcpyDeviceToHost, stream));
+            }
             sync_ck();
             const auto t2 = now();
             gen.t_draft += ms(t0, t1);
@@ -4396,7 +4406,31 @@ public:
                     }
                 if (leaf && path.size() > best.size()) best = path;
             };
-            if (nl) {
+            uint32_t sbonus = 0;
+            if (sampling()) {
+                // Exact sampling down the tree (src/tree_sample.hpp): at node v the target distribution p_v (column
+                // v's top-16 with the request's temperature / top-k / top-p) is sampled without replacement over v's
+                // children in column order; when none is accepted the token comes from the residual. Every emitted
+                // token is an exact sample of its p_v; going deeper has probability p_v's mass on the children.
+                std::uniform_real_distribution<double> uni(0.0, 1.0);
+                for (int node = 0;;) {
+                    Dist r = dist(node);
+                    int kids[NVER], nk = 0;
+                    uint32_t kt[NVER];
+                    for (int c = node + 1; c < n; ++c)
+                        if (tpar[size_t(c)] == node) kids[nk] = c, kt[nk++] = in[size_t(c)];
+                    const int a = tqllm::tree_sample_step(r.id, r.p, r.n, kt, nk, [&] { return uni(rng); });
+                    const int next = a < 0 ? -1 : kids[a];
+                    if (next < 0) {
+                        double tot = 0;
+                        for (int i = 0; i < r.n; ++i) tot += r.p[i];
+                        sbonus = tot > 0 ? draw(r) : draw(dist(node));
+                        break;
+                    }
+                    path.push_back(next);
+                    node = next;
+                }
+            } else if (nl) {
                 walk(0);
                 path = best;
             } else {  // no lookup chain: sibling tokens are distinct, the first match is the only one
@@ -4418,7 +4452,7 @@ public:
                 out.push_back(in[size_t(path[size_t(i)])]);
                 hit_eos |= in[size_t(path[size_t(i)])] == eos_;
             }
-            const uint32_t bonus = res[size_t(path.back())];
+            const uint32_t bonus = sampling() ? sbonus : res[size_t(path.back())];
             if (out.size() < count) out.push_back(bonus);
             const auto t3 = now();
             bool contiguous = true;
