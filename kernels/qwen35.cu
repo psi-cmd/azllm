@@ -245,7 +245,9 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
                                                    __nv_bfloat16 * y, int kheads, int vheads, int dv, bool tiled,
                                                    const int * par = nullptr, const tqllm_cuda::GdnReplay rp = {}) {
     static_assert(DK == 128, "one element per thread for the q / k loads");
-    constexpr int SL = GDN_SL, CPW = 32 / SL, R = DK / SL, NMAX = 16;
+    // NMAX 24: a deferred tree step holds the previous step's accepted path (<= 8 with a block-8 drafter) and a tree of
+    // up to 16 columns in one token group
+    constexpr int SL = GDN_SL, CPW = 32 / SL, R = DK / SL, NMAX = 24;
     // tree + deferred commit (rp.pend): the previous step's accepted path (rp.* rows, *rp.pend tokens) first, then its
     // state -> rp.smid, then the tree from there. Tokens 0 .. pend - 1 are the replay, pend .. pend + n - 1 the tree.
     const int pend = par && rp.pend ? *rp.pend : 0;
@@ -269,6 +271,7 @@ __global__ void __launch_bounds__(128) gdn_multi_k(const __nv_bfloat16 * qkv, in
         for (int i = 0; i < R; ++i) S0[i][t] = S[i];
     }
     const int ntot = n + pend;
+    if (par && ntot > NMAX) __trap();  // a tree (and its deferred replay) must fit one token group
     for (int g0 = 0; g0 < ntot; g0 += NMAX) {  // token groups; the state column stays in registers throughout
         const int ng = min(NMAX, ntot - g0);
     #pragma unroll
@@ -880,7 +883,7 @@ void gdn_multi(const __nv_bfloat16 * qkv, int n, const __nv_bfloat16 * a0, const
                int vheads, int dk, int dv, bool tiled, cudaStream_t s, const int * par, const GdnReplay & rp) {
     if (dk != 128 || dv % 32) throw std::invalid_argument("gdn_multi: dk 128, dv % 32 == 0");
     if (par && n > 16) throw std::invalid_argument("gdn_multi: tree mode needs n <= 16");
-    if (rp.smid && (!par || n > 8)) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode, n <= 8");
+    if (rp.smid && (!par || n > 16)) throw std::invalid_argument("gdn_multi: deferred replay needs tree mode, n <= 16");
     if (dv % GDN_CPB) throw std::invalid_argument("gdn_multi: dv % columns per block");
     gdn_multi_k<128><<<dim3(vheads, dv / GDN_CPB), 128, 0, s>>>(qkv, n, a0, b0, ab_stride, neg_a, dt_bias, in, out, y, kheads,
                                                           vheads, dv, tiled, par, rp);

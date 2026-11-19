@@ -781,6 +781,78 @@ int main() {
         tqllm_cuda::dflash_chain(di, ds, want, dc, nullptr);
         verdict("dflash_chain_sample T=0", host(dg, size_t(want)) == host(dc, size_t(want)), "== dflash_chain");
     }
+    { // device token tree: the best-first node set of the host reference, emitted depth first (likeliest child first)
+        const int B = 8, budget = 15;
+        bool ok = true;
+        for (int trial = 0; trial < 20 && ok; ++trial) {
+            std::vector<uint32_t> idx(size_t(B) * 16);
+            for (auto & c : idx) c = g() % 248320;
+            std::vector<float> score(size_t(B) * 256);
+            for (auto & v : score) v = float(nd(g) * 3);
+            // host best-first selection (the kernel's order before the depth-first pass)
+            struct RefNode { int d, c, par; float lp; };
+            std::vector<RefNode> sel{{0, 0, -1, 0.f}}, pool;
+            auto push = [&](int node) {
+                const int d = sel[size_t(node)].d + 1;
+                if (d >= B) return;
+                const float * row = score.data() + (size_t(d) * 16 + (d == 1 ? 0 : sel[size_t(node)].c)) * 16;
+                const float mx = *std::max_element(row, row + 16);
+                float z = 0.f;
+                for (int k = 0; k < 16; ++k) z += std::exp(row[k] - mx);
+                for (int k = 0; k < 16; ++k) pool.push_back({d, k, node, sel[size_t(node)].lp + (row[k] - mx) - std::log(z)});
+            };
+            push(0);
+            while (int(sel.size()) < budget + 1 && !pool.empty()) {
+                size_t b = 0;
+                for (size_t i = 1; i < pool.size(); ++i)
+                    if (pool[i].lp > pool[b].lp) b = i;
+                sel.push_back(pool[b]);
+                pool[b] = pool.back(), pool.pop_back();
+                push(int(sel.size()) - 1);
+            }
+            auto key = [&](const std::vector<int> & par, const std::vector<uint32_t> & tk, int i) {
+                std::vector<uint32_t> p;
+                for (int a = i; a >= 0; a = par[size_t(a)]) p.push_back(tk[size_t(a)]);
+                return p;
+            };
+            const int n = int(sel.size());
+            std::vector<int> rpar(static_cast<size_t>(n));
+            std::vector<uint32_t> rtok(static_cast<size_t>(n));
+            const uint32_t anchor = 7;
+            for (int i = 0; i < n; ++i) rpar[size_t(i)] = sel[size_t(i)].par, rtok[size_t(i)] = i ? idx[size_t(sel[size_t(i)].d) * 16 + sel[size_t(i)].c] : anchor;
+            auto * di = dev(idx);
+            auto * ds = dev(score);
+            auto * da = dev(std::vector<uint32_t>{anchor});
+            auto * dt = dev(std::vector<uint32_t>(size_t(n), 0u));
+            auto * dp = dev(std::vector<int>(size_t(n), 0));
+            auto * dd = dev(std::vector<int>(size_t(n), 0));
+            tqllm_cuda::dflash_tree(di, ds, da, B, budget, dt, dp, dd, nullptr);
+            const std::vector<uint32_t> gt = host(dt, size_t(n));
+            const std::vector<int> gp = host(dp, size_t(n));
+            const auto gd = host(dd, size_t(n));
+            std::vector<std::vector<uint32_t>> want_paths, got_paths;
+            for (int i = 0; i < n; ++i) want_paths.push_back(key(rpar, rtok, i)), got_paths.push_back(key(gp, gt, i));
+            // reference selection rank of each device node (by its root path)
+            std::vector<int> rank(static_cast<size_t>(n), -1);
+            for (int i = 0; i < n; ++i)
+                for (int r = 0; r < n; ++r)
+                    if (got_paths[size_t(i)] == want_paths[size_t(r)]) rank[size_t(i)] = r;
+            ok &= gp[0] == -1 && gt[0] == anchor;
+            for (int i = 1; i < n && ok; ++i) {
+                ok &= gp[size_t(i)] >= 0 && gp[size_t(i)] < i && rank[size_t(i)] >= 0;  // parents first, same node set
+                ok &= gd[size_t(i)] == gd[size_t(gp[size_t(i)])] + 1;
+                bool on_prev_path = false;  // depth first: the parent is node i - 1 or one of its ancestors
+                for (int a = i - 1; a >= 0; a = gp[size_t(a)]) on_prev_path |= a == gp[size_t(i)];
+                ok &= on_prev_path;
+                for (int j = 1; j < i; ++j)  // siblings keep the selection order
+                    if (gp[size_t(j)] == gp[size_t(i)]) ok &= rank[size_t(j)] < rank[size_t(i)];
+            }
+            std::sort(want_paths.begin(), want_paths.end());
+            std::sort(got_paths.begin(), got_paths.end());
+            ok &= want_paths == got_paths;
+        }
+        verdict("dflash_tree", ok, "best-first set, depth-first order (20 trees)");
+    }
     std::printf("%s\n", failures ? "DFLASH TESTS FAILED" : "all dflash tests passed");
     return failures ? 1 : 0;
 }

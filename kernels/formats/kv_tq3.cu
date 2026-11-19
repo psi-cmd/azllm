@@ -301,6 +301,17 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     // dstart (TqCache): keys below it are served by a compact stand-in segment (attn_compact_k); multiple of TILE
     const int stride = nsplit * TILE, kbeg = (dstart ? *dstart : 0) + split * TILE, kend = key_end;
     const int ntile = kbeg < kend ? (kend - kbeg + stride - 1) / stride : 0;
+#if !TQLLM_USE_BW_PRIMITIVES
+    if (pstride && ntile == 0) {  // no key for any row of this split: only the empty markers attn_blk_codec_k reads
+        for (int r = threadIdx.x; r < ROWS; r += NT) {
+            const int gr = r0 + r;
+            if (gr >= rows) break;
+            float * pr = part + ((int64_t(gr / g) * heads + kh * g + gr % g) * pstride + split + poff) * (DIM + 2);
+            pr[DIM] = -CUDART_INF_F, pr[DIM + 1] = 0.f;  // = m * ln 2 and l of a split that saw no key
+        }
+        return;
+    }
+#endif
 
     // Q -> TQ3_0 rotation per 32 (signs, WHT / sqrt(32)) -> int8 per (row, 128)
     for (int pr = warp; pr < ROWS * 2; pr += NW) {
@@ -496,9 +507,9 @@ __global__ void __launch_bounds__(NW * 32, NB == 1 ? 2 : 1) attn_tq3kv_k(const _
     const int ps = pstride ? pstride : cstride ? cstride : nsplit;
     float * pa = part + (ha * ps + split + poff) * (DIM + 2), * pb = part + (hb * ps + split + poff) * (DIM + 2);
 #pragma unroll
-    for (int j = 0; j < 32; ++j) {
-        if (ga < rows) pa[8 * j + 2 * tig] = o[j][0], pa[8 * j + 2 * tig + 1] = o[j][1];
-        if (gb < rows) pb[8 * j + 2 * tig] = o[j][2], pb[8 * j + 2 * tig + 1] = o[j][3];
+    for (int j = 0; j < 32; ++j) {  // two-part merge (pstride) skips the values of rows that saw no key (l == 0)
+        if (ga < rows && (!pstride || l_a > 0.f)) pa[8 * j + 2 * tig] = o[j][0], pa[8 * j + 2 * tig + 1] = o[j][1];
+        if (gb < rows && (!pstride || l_b > 0.f)) pb[8 * j + 2 * tig] = o[j][2], pb[8 * j + 2 * tig + 1] = o[j][3];
     }
     if (tig == 0) {
         constexpr float LN2 = 0.6931471805599453f;
@@ -862,6 +873,14 @@ static void attention_kc_vc(const __nv_bfloat16 * q, const void * kc, const void
     // 4-query launches single buffered (two blocks per SM; 5060 Ti 200K 86 -> 103 tok/s, 3090 +17-19% vs double)
     if (par) {  // cache part in launches of <= 64 rows with the same split count, so a query's result is width independent
         const int ps = nsplit + 1, qmax = 64 / (h / kh);
+#if !TQLLM_USE_BW_PRIMITIVES
+        // 65..128 rows (a 15-node tree is 96): one 8-warp block per (KV head, split) reads the cache once for every
+        // query. Each warp owns 16 rows and a row's arithmetic does not depend on the warp count, so results are the
+        // same as in 64-row launches.
+        if ((h / kh) * nq > 64 && (h / kh) * nq <= 128) {
+            tq3_launch<8, KC, VC>(q, k, v, y, part, dseq0, nq, h, kh, scale, nsplit, s, dep, ps, 0, d0);
+        } else
+#endif
         for (int z0 = 0; z0 < nq; z0 += qmax) {
             const int nz = std::min(qmax, nq - z0);
             const auto * qz = q + int64_t(z0) * h * 256;

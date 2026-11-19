@@ -252,6 +252,21 @@ __global__ void dflash_tree_k(const uint32_t * idx, const float * score, const u
         --np, plp[b] = plp[np], pd[b] = pd[np], pc[b] = pc[np], pp[b] = pp[np];
         push(n++);
     }
+    // depth-first order, children in selection (best-first) order: consecutive nodes are mostly parent and child, so
+    // the GDN tree recurrence rarely rebuilds a branch, and the likeliest chain is columns 0, 1, 2, ... Parents still
+    // precede children; every node's ancestors (hence its arithmetic) are unchanged.
+    int order[MAXN], inv[MAXN], stack[MAXN], sp = 0, m = 0;
+    uint32_t t2[MAXN];
+    int p2[MAXN], d2[MAXN];
+    stack[sp++] = 0;
+    while (sp) {
+        const int v = stack[--sp];
+        order[m++] = v;
+        for (int c = n - 1; c > v; --c)  // pushed last-first, so the first selected child is visited first
+            if (par[c] == v) stack[sp++] = c;
+    }
+    for (int i = 0; i < n; ++i) inv[order[i]] = i, t2[i] = tok[order[i]], p2[i] = par[order[i]], d2[i] = dep[order[i]];
+    for (int i = 0; i < n; ++i) tok[i] = t2[i], par[i] = p2[i] < 0 ? -1 : inv[p2[i]], dep[i] = d2[i];
 }
 // Greedy chain through the DFlash2 lattice (dflash_draft_batch's host chain, on the device): tok[i - 1], i = 1..want,
 // is the first highest-scoring candidate in the row of the previous pick.

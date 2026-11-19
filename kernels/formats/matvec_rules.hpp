@@ -32,6 +32,7 @@ struct Rule {
     int cc_min, cc_max;          // compute capability as major * 10 + minor (86 = 3090, 120 = 5060 Ti, 121 = GB10)
     int kb_min, kb_max;          // k / 32
     int rows_min;
+    int nc_max;                  // the rule applies up to this many columns (prefetch modes only: they give the same numbers)
     Pick pick;
     const char * why;
 };
@@ -40,15 +41,18 @@ constexpr int ANY = 1 << 30;
 // TQ3: Split16 and Legacy differ in MMA grouping (within 0.6%, tests/quant.cu tq3_verify_kernel), so the choice is fixed
 // per (cc, shape) - never timed at run time. TQ4: Split16 and Legacy give the same numbers (tq4_verify_kernel).
 inline constexpr Rule RULES[] = {
-    {3, 121, 121, 0, ANY, 0, {Kern::Legacy, 0}, "TQ3 every shape, GB10: TQ_XS decode 14.65 -> 18.2 tok/s no drafter, 72.8 -> 89.4 with DFlash2; KLD 0.07925 vs 0.07932"},
-    {3, 100, ANY, 257, ANY, 0, {Kern::Legacy, 0}, "TQ3 long k, Blackwell: 5060 Ti 20480x17408 legacy 416 us vs split16 476-543"},
-    {3, 0, ANY, 257, ANY, 0, {Kern::Split16, 1}, "TQ3 long k: 3090 5120x17408 split16+pf1 64.2 us vs legacy 78.9"},
-    {3, 0, ANY, 0, 256, 0, {Kern::Split16, 0}, "TQ3 short k: 3090 17408x5120 53.4 vs 70.0 us; 5060 Ti 336 vs 346 (4x rows)"},
-    {4, 0, ANY, 0, 256, 8192, {Kern::Split16, 0}, "TQ4 short k, many rows: 3090 17408x5120 59.7 vs 64.3 us"},
-    {4, 0, ANY, 0, ANY, 0, {Kern::Legacy, 0}, "TQ4 small rows / long k: 3090 5120x6144 legacy 31.5 vs 36.1; 5120x17408 59.5 vs 73"},
-    {14, 0, ANY, 0, ANY, 0, {Kern::Split16, 0}, "IQ4N: split16 only; pf 0 best on 3090 (17408x5120 63.4 us, 5120x17408 71.8)"},
-    {21, 0, ANY, 257, ANY, 0, {Kern::Legacy, 0}, "IQ3 long k: 3090 5120x17408 u4h 83.4 vs split16 98.8 us"},
-    {21, 0, ANY, 0, 256, 0, {Kern::Split16, 0}, "IQ3 short k: 3090 17408x5120 split16 73.3 vs u4h 80.3 us"},
+    // RTX 4090 (cc 89), tests/matvec_sweep.cu with the weights cycled through 512 MB (L2 is 72 MB): TQ3 split16 at <= 8
+    // columns streams far better with two k steps per iteration; at 16 columns pf 0 stays best. Same numbers in every mode.
+    {3, 89, 89, 0, 256, 6144, 8, {Kern::Split16, 2}, "TQ3 short k <= 8 cols, 4090: 34816x5120 81.2 vs 107.8 us, 10240x5120 26.6 vs 33.7"},
+    {3, 121, 121, 0, ANY, 0, ANY, {Kern::Legacy, 0}, "TQ3 every shape, GB10: TQ_XS decode 14.65 -> 18.2 tok/s no drafter, 72.8 -> 89.4 with DFlash2; KLD 0.07925 vs 0.07932"},
+    {3, 100, ANY, 257, ANY, 0, ANY, {Kern::Legacy, 0}, "TQ3 long k, Blackwell: 5060 Ti 20480x17408 legacy 416 us vs split16 476-543"},
+    {3, 0, ANY, 257, ANY, 0, ANY, {Kern::Split16, 1}, "TQ3 long k: 3090 5120x17408 split16+pf1 64.2 us vs legacy 78.9"},
+    {3, 0, ANY, 0, 256, 0, ANY, {Kern::Split16, 0}, "TQ3 short k: 3090 17408x5120 53.4 vs 70.0 us; 5060 Ti 336 vs 346 (4x rows)"},
+    {4, 0, ANY, 0, 256, 8192, ANY, {Kern::Split16, 0}, "TQ4 short k, many rows: 3090 17408x5120 59.7 vs 64.3 us"},
+    {4, 0, ANY, 0, ANY, 0, ANY, {Kern::Legacy, 0}, "TQ4 small rows / long k: 3090 5120x6144 legacy 31.5 vs 36.1; 5120x17408 59.5 vs 73"},
+    {14, 0, ANY, 0, ANY, 0, ANY, {Kern::Split16, 0}, "IQ4N: split16 only; pf 0 best on 3090 (17408x5120 63.4 us, 5120x17408 71.8)"},
+    {21, 0, ANY, 257, ANY, 0, ANY, {Kern::Legacy, 0}, "IQ3 long k: 3090 5120x17408 u4h 83.4 vs split16 98.8 us"},
+    {21, 0, ANY, 0, 256, 0, ANY, {Kern::Split16, 0}, "IQ3 short k: 3090 17408x5120 split16 73.3 vs u4h 80.3 us"},
 };
 constexpr int MAX_BITS = 32;
 
@@ -97,7 +101,8 @@ inline Pick lookup(int bits, int cc, int rows, int k, int ncols, const char ** w
     }
     const int kb = k / 32;
     for (const auto & r : RULES)
-        if (r.bits == bits && cc >= r.cc_min && cc <= r.cc_max && kb >= r.kb_min && kb <= r.kb_max && rows >= r.rows_min) {
+        if (r.bits == bits && cc >= r.cc_min && cc <= r.cc_max && kb >= r.kb_min && kb <= r.kb_max && rows >= r.rows_min &&
+            ncols <= r.nc_max) {
             if (why) *why = r.why;
             return r.pick;
         }
@@ -112,9 +117,9 @@ inline Pick choose(int bits, int rows, int k, int ncols) {
     static const bool log = tqllm::debug_on("matvec");
     if (log) {
         static std::mutex mu;
-        static std::set<std::tuple<int, int, int, int>> seen;
+        static std::set<std::tuple<int, int, int, int, int, int>> seen;
         std::lock_guard<std::mutex> lock(mu);
-        if (seen.insert({bits, rows, k, ncols <= 8 ? 8 : 16}).second)
+        if (seen.insert({bits, rows, k, ncols <= 8 ? 8 : 16, int(p.kern), p.pf}).second)
             std::fprintf(stderr, "matvec pick: bits %d cc %d %d x %d cols<=%d -> %s pf %d (%s)\n", bits, device_cc(), rows, k,
                          ncols <= 8 ? 8 : 16, p.kern == Kern::Split16 ? "split16" : "legacy", p.pf, why);
     }

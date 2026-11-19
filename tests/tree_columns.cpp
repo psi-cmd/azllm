@@ -15,11 +15,9 @@ int main() {
                     worst = std::max(worst, n);
                     if (n > cap || n < 1) ++failures;
                 }
-    // the old sizing (compile-time 16 columns) for the cases that failed: lookup 8 on a 7-draft tree, draft-max 10
-    const int old_lookup = 1 + std::min(7, 16 - 1 - 8) + 8, old_dmax = 1 + std::min(10, 16 - 1);
-    std::printf("old sizing: lookup 8 + 7 drafts = %d columns, draft-max 10 = %d columns (limit %d)\n", old_lookup, old_dmax, cap);
-    std::printf("new sizing: widest verify %d columns over all options\n", worst);
-    if (failures || old_lookup <= cap || old_dmax <= cap) { std::printf("tree_columns: %d failure(s)\n", failures); return 1; }
+    // the deferred-commit GDN kernel holds the previous accepted path (<= 8) plus the tree in one 24-token group
+    std::printf("widest verify %d columns over all options (limit %d)\n", worst, cap);
+    if (failures || cap > 16 || worst > 16) { std::printf("tree_columns: %d failure(s)\n", failures); return 1; }
     std::puts("tree_columns: ok");
     return 0;
 }

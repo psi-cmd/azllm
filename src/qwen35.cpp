@@ -53,7 +53,7 @@
 #include <vector>
 
 #ifndef TQLLM_VERIFY_COLUMNS
-#define TQLLM_VERIFY_COLUMNS 12
+#define TQLLM_VERIFY_COLUMNS 16
 #endif
 
 namespace tqllm {
@@ -1603,11 +1603,13 @@ private:
             if (kv_row_bytes(true) % 16 || kv_row_bytes(false) % 16)
                 throw std::runtime_error("tree verify: KV rows must be a multiple of 16 bytes");
             tree_mode = true;
-            {  // deferred commit: GB10 (memory-bound) 73.6 -> 72.8 ms per round, no change on the 3090
-                int dev = 0, major = 0;
+            {  // deferred commit: GB10 (memory-bound) 73.6 -> 72.8 ms per round, no change on the 3090; 4090 (8.9) greedy
+               // 15-node tree 272.4 -> 276.8 tok/s, 7-node unchanged, 30K context 146.7 -> 147.8 (same tokens)
+                int dev = 0, major = 0, minor = 0;
                 cudaGetDevice(&dev);
                 cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-                defer = major >= 10;
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+                defer = major >= 10 || (major == 8 && minor == 9);
             }
         }
         v_pos = Buf(2 * size_t(nslots) * sizeof(int));
@@ -2466,6 +2468,8 @@ public:
         int dev = 0, sms = 0;
         cudaGetDevice(&dev);
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        // 4090, 30K context: split factor 1 / 2 / 4 / 8 -> 96 / 85 / 118 / 167 us per tree-attention launch (2 is best
+        // from short to long context; 1 wins only below ~2K keys)
         mq_split = std::clamp(kvf->split_factor() * sms / int(cfg.kvheads), 1, 256);
     }
     bool segs_fit_part() {
@@ -2693,7 +2697,7 @@ public:
         }
         if (!k_head()) throw std::runtime_error("multi-token path needs a Q6_K / Q5_K LM head");
         const bool two_stage = !full_logits;
-        if (two_stage && head4.p && has_head8() && (n <= 8 || !segs.empty())) {  // 4-bit head -> top-16 -> exact int8 re-score
+        if (two_stage && head4.p && has_head8() && (n <= NVER || !segs.empty())) {  // 4-bit head -> top-16 -> exact int8 re-score
             tqllm_cuda::bf16_to_h(NP, v_xh.as<__half>(), n * H, stream);
             for (int c0 = 0; c0 < n; c0 += 32)  // batched verify: every slot's columns in one pass per 32
                 tqllm_cuda::u4h_matvec(head4.as<uint8_t>(), head4s.as<__half2>(), v_xh.as<__half>() + size_t(c0) * H,
