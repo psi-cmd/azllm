@@ -4015,9 +4015,14 @@ public:
                 }
             }
             if (!use_mtp) next = h_tok[0];
-            if (sampling()) {  // the final chunk's head wrote column 0's top-16
-                ck(cudaMemcpy(h_sid.data(), s_id.p, 16 * 4, cudaMemcpyDeviceToHost));
-                ck(cudaMemcpy(h_slg.data(), s_lg.p, 16 * 4, cudaMemcpyDeviceToHost));
+            if (sampling()) {
+                // the final chunk's last position: a chunk of more than NVER tokens moved it to column 0 before the head,
+                // a shorter one went through the head whole (as greedy reads it, verify_async). Reading column 0 of a
+                // short final chunk sampled the token after its FIRST position: with the chunk split at the last
+                // <|im_start|> that is a role name, and answers began "assistant\n" or invented a user turn.
+                const size_t col = m_last > NVER ? 0 : size_t(m_last - 1);
+                ck(cudaMemcpy(h_sid.data(), s_id.as<uint32_t>() + col * 16, 16 * 4, cudaMemcpyDeviceToHost));
+                ck(cudaMemcpy(h_slg.data(), s_lg.as<float>() + col * 16, 16 * 4, cudaMemcpyDeviceToHost));
                 next = draw(dist(0));
             }
             if (kv_cmp && opt.kv_compact_turn) {  // refit the old blocks on this request's queries before decoding
