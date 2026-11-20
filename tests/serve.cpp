@@ -156,6 +156,16 @@ void test_tool_stream_limit() {
         const std::string streamed = raw.substr(0, tool_stream_limit(raw));
         check(streamed.find('<') == std::string::npos && streamed.compare(0, r.text.size(), r.text) == 0, "tools: streamed prose is the parsed answer's prefix");
     }
+    {  // tool-call ids are unique across answers (clients key calls by id over the whole conversation), not call_0 each time
+        const std::string raw = "<function=a>\n</function>\n<function=b>\n</function>";
+        tqserve::DecodeResult r1, r2;
+        r1.text = r2.text = raw;
+        tqserve::extract_tool_calls(r1), tqserve::extract_tool_calls(r2);
+        check(r1.tool_calls.size() == 2 && r2.tool_calls.size() == 2 && r1.tool_calls[0].id.rfind("call_", 0) == 0 &&
+                  r1.tool_calls[0].id != r1.tool_calls[1].id && r1.tool_calls[0].id != r2.tool_calls[0].id &&
+                  r1.tool_calls[1].id != r2.tool_calls[1].id,
+              "tools: call ids unique within and across answers");
+    }
 }
 
 void test_chat_prompt() {

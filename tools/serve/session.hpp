@@ -495,7 +495,17 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
 
 struct ToolCall {
     std::string name, arguments;  // arguments: JSON object text
+    std::string id;               // unique across the server's lifetime (new_reply_id("call_"))
 };
+
+// Ids for replies and tool calls. Agent clients (pi, OpenAI SDK based UIs) key tool-call widgets and results by id
+// across the whole conversation, so per-answer ids (call_0 in every reply) made every earlier call_0 update together.
+inline std::string new_reply_id(const char * prefix) {
+    static std::atomic<unsigned long long> n{0};
+    char b[64];
+    std::snprintf(b, sizeof b, "%s%llx%06llx", prefix, static_cast<unsigned long long>(std::time(nullptr)), ++n);
+    return b;
+}
 
 struct DecodeResult {
     std::string text;
@@ -895,6 +905,7 @@ inline void extract_tool_calls(DecodeResult & r) {
         if (fe == std::string::npos) continue;
         ToolCall call;
         call.name = trim(block.substr(10, fe - 10));
+        call.id = new_reply_id("call_");
         std::string args = "{";
         size_t p = fe;
         while ((p = block.find("<parameter=", p)) != std::string::npos) {
@@ -930,7 +941,7 @@ inline void usage_timings(std::string & out, const DecodeResult & result);
 
 inline std::string completion_json(const std::string & model, const DecodeResult & result, bool chat) {
     std::string out = "{\"id\":";
-    jstr(out, chat ? "chatcmpl-tqllm" : "cmpl-tqllm");
+    jstr(out, new_reply_id(chat ? "chatcmpl-" : "cmpl-"));
     out += chat ? ",\"object\":\"chat.completion\",\"model\":" : ",\"object\":\"text_completion\",\"model\":";
     jstr(out, model);
     out += ",\"choices\":[{\"index\":0,";
@@ -947,7 +958,7 @@ inline std::string completion_json(const std::string & model, const DecodeResult
             for (size_t i = 0; i < result.tool_calls.size(); ++i) {
                 if (i) out.push_back(',');
                 out += "{\"id\":";
-                jstr(out, "call_" + std::to_string(i));
+                jstr(out, result.tool_calls[i].id);
                 out += ",\"type\":\"function\",\"function\":{\"name\":";
                 jstr(out, result.tool_calls[i].name);
                 out += ",\"arguments\":";
@@ -999,7 +1010,7 @@ public:
     using Send = std::function<bool(const std::string &)>;  // false: the client went away
     StreamWriter(const tqllm::Tokenizer & tok, const ChatRequest & req, std::string model, Send send)
         : tok_(tok), req_(req), plain_(req), model_(std::move(model)), send_(std::move(send)),
-          created_(std::to_string(std::time(nullptr))) {
+          created_(std::to_string(std::time(nullptr))), id_(new_reply_id(req.chat ? "chatcmpl-" : "cmpl-")) {
         plain_.tools = false;
         for (const auto & st : req.stop) hold_ = std::max(hold_, st.empty() ? size_t(0) : st.size() - 1);
     }
@@ -1024,7 +1035,7 @@ public:
                 for (size_t i = 0; i < result.tool_calls.size(); ++i) {
                     if (i) out.push_back(',');
                     out += "{\"index\":" + std::to_string(i) + ",\"id\":";
-                    jstr(out, "call_" + std::to_string(i));
+                    jstr(out, result.tool_calls[i].id);
                     out += ",\"type\":\"function\",\"function\":{\"name\":";
                     jstr(out, result.tool_calls[i].name);
                     out += ",\"arguments\":";
@@ -1057,7 +1068,7 @@ public:
 private:
     std::string head() const {
         std::string out = "{\"id\":";
-        jstr(out, req_.chat ? "chatcmpl-tqllm" : "cmpl-tqllm");
+        jstr(out, id_);
         out += req_.chat ? ",\"object\":\"chat.completion.chunk\"" : ",\"object\":\"text_completion\"";
         out += ",\"created\":" + created_ + ",\"model\":";
         jstr(out, model_);
@@ -1111,7 +1122,7 @@ private:
     ChatRequest plain_;  // req without tool parsing: intermediate texts
     std::string model_;
     Send send_;
-    std::string created_, sr_, sc_;
+    std::string created_, id_, sr_, sc_;  // id_: one per response, the same in every chunk
     size_t hold_ = 0, seen_ = 0;
     bool role_sent_ = false;
 };
