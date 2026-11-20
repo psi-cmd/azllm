@@ -113,7 +113,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 }
 
 void usage() {
-    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--guard on|off] [--guard-rescues N] [--guard-window N] [--guard-scan N] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N] [--mmproj-bits 16|8|4] [--image-cache-mb N (512)]] "
+    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--think-loop N (384 tokens; 0 off)] [--guard on|off] [--guard-rescues N] [--guard-window N] [--guard-scan N] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N] [--mmproj-bits 16|8|4] [--image-cache-mb N (512)]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
                  "[--repeat-limit N (default 256, 0 off)] [--temp F (default 0 = greedy, for requests that send none)] [--top-p F (default 0.95; 1 = sample the whole candidate set)] [--top-k N (default 0 = all; the sampler scores 16 candidates, so >16 has no effect)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
@@ -218,6 +218,7 @@ int main(int argc, char ** argv) {
             else if (tqllm::parse_engine_option(argc, argv, i, engine)) continue;
             else if (arg == "--draft-max" || arg == "--draft") tqserve::serve_options().draft_max = std::clamp(std::stoi(value()), 1, 15);
             else if (arg == "--repeat-limit") tqserve::serve_options().repeat_limit = static_cast<uint32_t>(std::stoul(value()));
+            else if (arg == "--think-loop") tqserve::serve_options().think_loop = static_cast<uint32_t>(std::stoul(value()));
             else if (arg == "--top-p") {
                 const double p = std::stod(value());
                 if (!(p > 0.0 && p <= 1.0)) throw std::invalid_argument("--top-p must be in (0, 1]");
@@ -492,11 +493,26 @@ int main(int argc, char ** argv) {
                     } else {
                         tqserve::StreamWriter out(tokenizer, parsed, name, send);
                         auto generated = run_stream(parsed, out);
-                        if (!generated.error.empty()) out.error(generated.error);
-                        else if (!guard_on) out.close(generated);
+                        tqserve::StreamWriter * writer = &out;
+                        std::unique_ptr<tqserve::StreamWriter> after_loop;
+                        if (generated.error.empty() && generated.thinking_loop) {
+                            // thinking loop: close the thinking as streamed so far and continue the answer (as a spent budget)
+                            auto cont = parsed;
+                            cont.thinking = false;
+                            cont.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
+                            cont.prompt_text += tqserve::trim_incomplete_utf8(generated.reasoning) + parsed.budget_message + "</think>";
+                            out.flush(generated);
+                            after_loop = std::make_unique<tqserve::StreamWriter>(tokenizer, cont, name, send);
+                            after_loop->mark_role_sent();
+                            auto more = cont.max_tokens > 0 ? run_stream(cont, *after_loop) : tqserve::DecodeResult{};
+                            tqserve::merge_continuation(generated, more);
+                            writer = after_loop.get();
+                        }
+                        if (!generated.error.empty()) writer->error(generated.error);
+                        else if (!guard_on) writer->close(generated);
                         else {
                             tqguard::Guard guard(guard_rescues, guard_window, guard_scan);
-                            tqserve::StreamWriter * final_writer = &out;
+                            tqserve::StreamWriter * final_writer = writer;
                             tqserve::DecodeResult final_result = generated;
                             for (;;) {
                                 auto d = guard.decide(generated.reasoning, generated.text, generated.finish_reason,
@@ -588,6 +604,14 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         generated = run(parsed);
+                        if (generated.error.empty() && generated.thinking_loop) {  // close the thinking, continue the answer
+                            auto cont = parsed;
+                            cont.thinking = false;
+                            cont.max_tokens = parsed.max_tokens - std::min(parsed.max_tokens, generated.completion_tokens);
+                            cont.prompt_text += tqserve::trim_incomplete_utf8(generated.reasoning) + parsed.budget_message + "</think>";
+                            auto more = cont.max_tokens > 0 ? run(cont) : tqserve::DecodeResult{};
+                            tqserve::merge_continuation(generated, more);
+                        }
                     }
                     if (guard_on && generated.error.empty()) {
                         tqguard::Guard guard(guard_rescues, guard_window, guard_scan);

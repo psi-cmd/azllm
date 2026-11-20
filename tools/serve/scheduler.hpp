@@ -36,6 +36,7 @@ public:
     DecodeResult submit(const ChatRequest & req) {
         auto job = std::make_shared<Job>();
         job->req = req;
+        if (req.thinking) job->repeat.arm_thinking(think_end_id(tokenizer_));
         job->prompt = prepare(tokenizer_, req, context_, job->result, job->count, &job->images);
         if (!job->result.error.empty()) return job->result;
         {
@@ -75,6 +76,7 @@ public:
         auto job = std::make_shared<Job>();
         job->req = req;
         job->stream = true;
+        if (req.thinking) job->repeat.arm_thinking(think_end_id(tokenizer_));
         job->prompt = prepare(tokenizer_, req, context_, job->result, job->count, &job->images);
         if (!job->result.error.empty()) return job->result;
         {
@@ -143,6 +145,7 @@ private:
         model_.select_slot(s);
         uint64_t st[5] = {};
         finish(tokenizer_, job->req, model_.spec_finish(st), job->result);
+        job->result.thinking_loop = job->repeat.loop;
         job->result.cached_tokens = model_.cached_prefix();  // the timing block rates only the prefilled part
         set_timings(job->result, st);
         complete(job);
