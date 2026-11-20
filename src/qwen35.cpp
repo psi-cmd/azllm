@@ -664,17 +664,23 @@ public:
         const uint32_t span = (P + pc_keep - 1) / pc_keep;
         return pc_step > span ? pc_step : span;
     }
-    void pc_ckpt_save(uint32_t pos) {  // one more resumable position, newest `keep` kept
+    void pc_ckpt_save(uint32_t pos, bool turn_end = false) {  // one more resumable position, `keep` kept
+        if (!pc_cks.empty() && pc_cks.back().pos >= pos) {    // already have it (or a later one): nothing new to resume at
+            if (pc_cks.back().pos == pos) pc_cks.back().turn_end = pc_cks.back().turn_end && turn_end;
+            return;
+        }
         if (!pc_cks.size() && pc_step)
             std::fprintf(stderr, "tqllm: prompt cache: snapshots of %zu MiB every %u tokens, keeping %zu\n",
                         (conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT) >> 20, pc_step,
                         size_t(pc_keep));
         if (pc_cks.size() >= pc_keep) {  // hand the evicted pinned buffer to the pool: cudaHostAlloc per save is not free
-            pc_pool.push_back(std::move(pc_cks.front().buf));
-            pc_cks.erase(pc_cks.begin());  // oldest first
+            const size_t v = pc_victim(pc_cks, pos);
+            pc_pool.push_back(std::move(pc_cks[v].buf));
+            pc_cks.erase(pc_cks.begin() + std::ptrdiff_t(v));
         }
         PcCk ck;
         ck.pos = pos;
+        ck.turn_end = turn_end;
         if (!pc_pool.empty()) { ck.buf = std::move(pc_pool.back()); pc_pool.pop_back(); }
         else ck.buf = std::make_unique<HostBuf>((conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT));
         pc_copy(true, ck.buf->p);
@@ -770,8 +776,29 @@ private:
     // State snapshots at --prompt-cache-step spacing, so a mid-history divergence has somewhere to resume. Each holds
     // only the recurrent/conv state (the per-position KV of the full-attention layers is already in the pool and needs
     // no copy); positions past the newest kept one are re-prefilled as today.
-    struct PcCk { uint32_t pos = 0; std::unique_ptr<HostBuf> buf; };
+    // turn_end: taken at the very end of a prompt, for that request's next turn only (evicted first once it has passed)
+    struct PcCk { uint32_t pos = 0; std::unique_ptr<HostBuf> buf; bool turn_end = false; };
     std::vector<PcCk> pc_cks;
+    // Which snapshot to drop for one at `pos` (positions ascending, all below `pos`). An earlier request's end-of-prompt
+    // snapshot goes first: it was there for that request's next turn, which has come. Otherwise the one whose removal
+    // leaves the smallest gap relative to its distance from the newest position, so the kept ones thin out with depth
+    // instead of crowding the last few turns: an agent loop saves one per request, and dropping the oldest left 16
+    // snapshots inside the last ~15K tokens, so a compaction summary rewinding ~30K re-read all 222K (measured).
+    static size_t pc_victim(const std::vector<PcCk> & cks, uint32_t pos) {
+        for (size_t i = 0; i < cks.size(); ++i) if (cks[i].turn_end) return i;
+        size_t best = 0;
+        double best_score = 1e300;
+        for (size_t i = 0; i < cks.size(); ++i) {
+            const uint32_t left = i ? cks[i - 1].pos : 0, right = i + 1 < cks.size() ? cks[i + 1].pos : pos;
+            const double score = double(right - left) / double(pos - left + 1);
+            if (score < best_score) best_score = score, best = i;
+        }
+        return best;
+    }
+    // <|im_start|> of the generation prompt: the state just before it is a message boundary any rewritten history that
+    // keeps the messages so far (a compaction summary, a branch) shares exactly; UINT32_MAX when the vocab has none
+    uint32_t im_start_id = 0;
+    bool im_start_known = false;
     uint32_t pc_keep = 16, pc_next = 0, pc_step = 0;   // interval checkpoints + turn boundaries (16 x ~146 MiB host)  // pc_next: where to snapshot next; pc_step: 0 = off
     std::vector<std::unique_ptr<HostBuf>> pc_pool;     // pinned buffers freed by eviction, reused by the next save
     bool pc_on = false, pc_live = false;
@@ -3889,6 +3916,17 @@ public:
         pc_next = pc_on && !pc_protect && pc_step ? P0 + pc_grid(P) : 0;
         pc_live = false;
         const uint32_t snap = pc_on && !pc_protect && P >= P0 + 2 * kTail ? P - kTail : 0;
+        // the last message boundary: the <|im_start|> that opens the generation prompt, a few tokens before P
+        uint32_t bnd = 0;
+        if (pc_on && !pc_protect && pc_step) {
+            if (!im_start_known) {
+                const auto ids = tokenizer.encode("<|im_start|>");
+                im_start_id = ids.size() == 1 ? ids[0] : UINT32_MAX;
+                im_start_known = true;
+            }
+            for (uint32_t i = P; i-- > P0 + 1 && i + kTail > P;)
+                if (prompt[i] == im_start_id) { bnd = i; break; }
+        }
         if (pc_on && !pc_protect) pc_seq.assign(prompt.begin(), prompt.end());
         if (kv_cmp && opt.kv_compact_turn && cmp_pos) cmp_reset();  // --kv-compact-at turn: the new tokens see exact KV
         // Queue prefill chunks on one stream and read back only the final next token.
@@ -3900,7 +3938,7 @@ public:
             const char * tf_path = tf_dump && !tf_dump->empty() ? tf_dump->c_str() : nullptr;
             // prefill chunk: NPF tokens through the GEMM path (the dump needs every argmax)
             const int CH = tf_path ? NVER : std::clamp(NPF, 1, NBUF);
-            const size_t chunks = (P - P0 + CH - 1) / CH + 1;  // + 1: the split at snap
+            const size_t chunks = (P - P0 + CH - 1) / CH + 2;  // + 2: the splits at snap and bnd
             pf_progress_begin(uint32_t(chunks));
             HostBuf staged_tokens(size_t(P) * sizeof(uint32_t));
             HostBuf staged_pos(chunks * 2 * sizeof(int));
@@ -3915,7 +3953,8 @@ public:
             const uint32_t inj0 = dfl.ring > 0 && P > uint32_t(dfl.ring) ? P - uint32_t(dfl.ring) : 0;
             try {
                 for (uint32_t t = P0, ci = 0; t < P; t += uint32_t(m_last), ++ci) {
-                    const int m = int(std::min<uint32_t>(std::min<uint32_t>(uint32_t(CH), P - t), snap > t ? snap - t : P));
+                    const int m = int(std::min<uint32_t>(std::min<uint32_t>(std::min<uint32_t>(uint32_t(CH), P - t), snap > t ? snap - t : P),
+                                                         bnd > t ? bnd - t : P));
                     m_last = m;
                     positions[2 * ci] = int(t);
                     positions[2 * ci + 1] = int(t) + 1;
@@ -3950,6 +3989,7 @@ public:
                         dflash_inject(v_feat.as<bf16>() + size_t(off) * nf * H, count, t + uint32_t(off));
                     }
                     if (t + uint32_t(m) == snap) pc_copy(true), pc_snap = snap;
+                    if (bnd && t + uint32_t(m) == bnd) pc_ckpt_save(bnd);
                     if (pc_next && t + uint32_t(m) >= pc_next) {  // first boundary at or past the target
                         pc_ckpt_save(t + uint32_t(m));
                         pc_next = t + uint32_t(m) + pc_grid(P);
@@ -3995,7 +4035,7 @@ public:
         // end of the prompt we just processed. A checkpoint here lets the next turn resume at P and
         // reuse the whole prompt, instead of falling back to the one snapshot at P-64 (which sits
         // inside the re-rendered region and is therefore useless) and re-reading everything.
-        if (pc_on && !pc_protect && P > 0) pc_ckpt_save(P);
+        if (pc_on && !pc_protect && P > 0) pc_ckpt_save(P, true);
         gen = Gen{};
         gen.out.assign(1, next);
         if (opt.lookup) gen.hist.assign(prompt.begin(), prompt.end());
