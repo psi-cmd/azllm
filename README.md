@@ -661,7 +661,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--np N` | 1 | requests served at once (batched verify); `GET`/`POST /admin/slots` reads or changes the live limit |
 | `--name NAME`, `--system TEXT` | | model name in the API; a default system prompt |
 | `--api-key KEY` / `--api-key-file FILE` | | require a bearer key |
-| `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]` | 8, 4096 | vision projector for image input |
+| `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N] [--mmproj-bits 16\|8\|4]` | 8, 4096, 16 | vision projector for image input; `--mmproj-bits` keeps its matrices as FP16, int8 or 4-bit (expanded per GEMM) |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
 | `--top-p F` | 0.95 | default nucleus over the scored candidates, for requests that omit `top_p` (1 = the whole set) |
 | `--top-k N` | 0 | default `top_k` for requests that omit it (0 = all candidates the model scores; see Sampling numbers) |

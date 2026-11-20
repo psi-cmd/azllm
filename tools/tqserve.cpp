@@ -113,7 +113,7 @@ int bind_socket(const std::string & host, uint16_t port) {
 }
 
 void usage() {
-    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--guard on|off] [--guard-rescues N] [--guard-window N] [--guard-scan N] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]] "
+    std::cerr << "usage: tqserve (--model-dir DIR | --model FILE [--tokenizer FILE]) [--host IPv4] [--port N] [--context N] [--max-tokens N] [--reasoning on|off] [--reasoning-effort low|medium|xhigh] [--reasoning-budget N (-1 unlimited, 0 end now; alias --thinking-budget)] [--reasoning-budget-message TEXT] [--reasoning-answer-reserve N (default 8192; 0 = llama.cpp: budget counts inside max_tokens)] [--guard on|off] [--guard-rescues N] [--guard-window N] [--guard-scan N] [--jinja (default) | --no-jinja] [--chat-template-file FILE] [--chat-template-kwargs JSON] [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N] [--mmproj-bits 16|8|4]] "
                  "[--system TEXT] [--name NAME] [--api-key KEY | --api-key-file FILE] [--np N] [--draft-max N (default: DFlash2 7, DSpark 3)] "
                  "[--repeat-limit N (default 256, 0 off)] [--temp F (default 0 = greedy, for requests that send none)] [--top-p F (default 0.95; 1 = sample the whole candidate set)] [--top-k N (default 0 = all; the sampler scores 16 candidates, so >16 has no effect)] [--list-kv] [--list-flags]\n"
               << tqllm::engine_options_usage()
@@ -159,7 +159,7 @@ int main(int argc, char ** argv) {
     std::string mmproj;
     bool use_jinja = true;  // llama.cpp default: render the prompt with the model's Jinja chat template; --no-jinja = native Qwen layout
     std::string template_file, template_kwargs_text;
-    int image_min_tokens = 8, image_max_tokens = 4096;
+    int image_min_tokens = 8, image_max_tokens = 4096, mmproj_bits = 16;
     tqllm::EngineOptions engine;
     try {
         for (int i = 1; i < argc; ++i) {
@@ -233,6 +233,7 @@ int main(int argc, char ** argv) {
             else if (arg == "--mmproj") mmproj = value();
             else if (arg == "--image-min-tokens") image_min_tokens = std::stoi(value());
             else if (arg == "--image-max-tokens") image_max_tokens = std::stoi(value());
+            else if (arg == "--mmproj-bits") mmproj_bits = std::stoi(value());
             else if (arg == "--api-key") api_key = value();
             else if (arg == "--api-key-file") {
                 std::ifstream key_file(value());
@@ -261,11 +262,12 @@ int main(int argc, char ** argv) {
             vis.pad_id = pad[0];
             if (cudaStreamCreateWithFlags(&vis.stream, cudaStreamNonBlocking) != cudaSuccess)
                 throw std::runtime_error("cannot create the vision stream");
-            vis.enc = tqllm::VisionEncoder::load(mmproj, vis.stream);
+            vis.enc = tqllm::VisionEncoder::load(mmproj, vis.stream, mmproj_bits);
             vis.enc->set_token_limits(image_min_tokens, image_max_tokens);
             tqserve::vision() = &vis;
             std::cerr << "tqserve: vision encoder " << mmproj << " (" << image_min_tokens << ".." << image_max_tokens
-                      << " tokens per image)\n";
+                      << " tokens per image, " << mmproj_bits << "-bit weights, "
+                      << vis.enc->weight_bytes() / (1u << 20) << " MiB)\n";
         }
         const auto model_ptr = std::make_unique<tqllm::Model>(model_path, tokenizer_path, context / np, int(np), engine);
         const uint32_t slot_context = model_ptr->context();  // the memory fit may have halved it

@@ -1,6 +1,6 @@
 // Image embeddings from an mmproj GGUF: [int32 nx, ny, n_tok, n_embd] + float[n_tok][n_embd] (the layout of
 // llama.cpp mtmd_get_output_embd, for parity checks).
-// usage: tqvision MMPROJ.gguf IMAGE OUT.bin [--image-min-tokens N] [--image-max-tokens N]
+// usage: tqvision MMPROJ.gguf IMAGE OUT.bin [--image-min-tokens N] [--image-max-tokens N] [--wbits 16|8|4]
 #include "../src/vision.hpp"
 
 #include <cuda_runtime.h>
@@ -15,18 +15,21 @@
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
-        std::fprintf(stderr, "usage: %s MMPROJ.gguf IMAGE OUT.bin [--image-min-tokens N] [--image-max-tokens N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s MMPROJ.gguf IMAGE OUT.bin [--image-min-tokens N] [--image-max-tokens N] [--wbits 16|8|4]\n",
+                     argv[0]);
         return 1;
     }
-    int mn = 8, mx = 4096;
+    int mn = 8, mx = 4096, wbits = 16;
     for (int i = 4; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--image-min-tokens")) mn = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--image-max-tokens")) mx = std::atoi(argv[i + 1]);
+        else if (!std::strcmp(argv[i], "--wbits")) wbits = std::atoi(argv[i + 1]);
     }
     try {
         cudaStream_t s;
         cudaStreamCreate(&s);
-        auto enc = tqllm::VisionEncoder::load(argv[1], s);
+        auto enc = tqllm::VisionEncoder::load(argv[1], s, wbits);
+        std::printf("weights on the device: %.0f MiB (%d-bit)\n", double(enc->weight_bytes()) / 1048576.0, wbits);
         enc->set_token_limits(mn, mx);
         std::ifstream in(argv[2], std::ios::binary);
         const std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
