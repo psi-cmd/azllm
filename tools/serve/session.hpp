@@ -990,7 +990,9 @@ inline std::string completion_json(const std::string & model, const DecodeResult
 inline void usage_timings(std::string & out, const DecodeResult & result) {
     out += ",\"usage\":{\"prompt_tokens\":" + std::to_string(result.prompt_tokens);
     out += ",\"completion_tokens\":" + std::to_string(result.completion_tokens);
-    out += ",\"total_tokens\":" + std::to_string(result.prompt_tokens + result.completion_tokens) + "}";
+    out += ",\"total_tokens\":" + std::to_string(result.prompt_tokens + result.completion_tokens);
+    // OpenAI's cache-read field (part of prompt_tokens): agent clients (pi, OpenAI SDK UIs) read cache hits only here
+    out += ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(result.cached_tokens) + "}}";
     // llama.cpp-style engine timings; the first token comes from prefill, so decode rate = (n - 1) / decode time
     const uint32_t n = result.completion_tokens;
     auto num = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.3f", v); return std::string(b); };

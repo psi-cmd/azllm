@@ -181,10 +181,16 @@ inline std::string new_id(const char * prefix) {
 }
 // chat answers number tool calls call_0, call_1 per answer; agent clients need ids unique across the conversation
 inline std::string unique_call(const std::string & chat_id) { return new_id("call") + "_" + chat_id; }
+// cache reads reported by the chat answer (usage.prompt_tokens_details.cached_tokens; part of prompt_tokens)
+inline double chat_cached(const Json * u) {
+    const Json * d = u ? field(*u, "prompt_tokens_details") : nullptr;
+    const Json * c = d ? field(*d, "cached_tokens") : nullptr;
+    return c ? c->num : 0;
+}
 inline Json resp_usage(const Json * u) {
     const double in = u ? field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0 : 0;
     const double outn = u ? field(*u, "completion_tokens") ? field(*u, "completion_tokens")->num : 0 : 0;
-    return O({{"input_tokens", N(in)}, {"input_tokens_details", O({{"cached_tokens", N(0)}})}, {"output_tokens", N(outn)},
+    return O({{"input_tokens", N(in)}, {"input_tokens_details", O({{"cached_tokens", N(chat_cached(u))}})}, {"output_tokens", N(outn)},
               {"output_tokens_details", O({{"reasoning_tokens", N(0)}})}, {"total_tokens", N(in + outn)}});
 }
 inline Json resp_object(const std::string & id, const std::string & model, const std::string & status, std::vector<Json> output,
@@ -461,8 +467,10 @@ inline std::string stop_reason(const std::string & finish, bool tools) {
     if (tools || finish == "tool_calls") return "tool_use";
     return finish == "length" ? "max_tokens" : "end_turn";
 }
+// Anthropic counts cache reads apart from input_tokens (input_tokens + cache_read_input_tokens = the whole prompt)
 inline Json anthropic_usage(const Json * u) {
-    return O({{"input_tokens", N(u && field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0)},
+    const double in = u && field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0, cached = chat_cached(u);
+    return O({{"input_tokens", N(in > cached ? in - cached : 0)}, {"cache_read_input_tokens", N(cached)},
               {"output_tokens", N(u && field(*u, "completion_tokens") ? field(*u, "completion_tokens")->num : 0)}});
 }
 inline Json tool_input(const std::string & args) {

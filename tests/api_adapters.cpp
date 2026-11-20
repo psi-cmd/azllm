@@ -85,6 +85,11 @@ static void test_responses_answer() {
               s(at(out->arr[1], "arguments")) == "{\"cmd\":\"ls\"}");
     }
     CHECK(at(*at(r, "usage"), "input_tokens")->num == 5 && at(*at(r, "usage"), "output_tokens")->num == 2);
+    // cache reads pass through: Responses keeps them inside input_tokens, Anthropic reports them apart
+    const Json cu = tqllm::parse_json(R"({"prompt_tokens":100,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":96}})");
+    const Json ru = tqserve::adapt::resp_usage(&cu), au = tqserve::adapt::anthropic_usage(&cu);
+    CHECK(at(ru, "input_tokens")->num == 100 && at(*at(ru, "input_tokens_details"), "cached_tokens")->num == 96);
+    CHECK(at(au, "input_tokens")->num == 4 && at(au, "cache_read_input_tokens")->num == 96 && at(au, "output_tokens")->num == 4);
 }
 
 static void test_responses_stream(bool tool) {

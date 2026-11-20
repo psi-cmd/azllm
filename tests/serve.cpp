@@ -166,6 +166,13 @@ void test_tool_stream_limit() {
                   r1.tool_calls[1].id != r2.tool_calls[1].id,
               "tools: call ids unique within and across answers");
     }
+    {  // cache reads in OpenAI's usage field (agent clients read cache hits only there)
+        tqserve::DecodeResult r;
+        r.text = "ok", r.prompt_tokens = 100, r.completion_tokens = 2, r.cached_tokens = 96;
+        const std::string j = tqserve::completion_json("m", r, true);
+        check(j.find("\"total_tokens\":102,\"prompt_tokens_details\":{\"cached_tokens\":96}}") != std::string::npos,
+              "usage: prompt_tokens_details.cached_tokens");
+    }
 }
 
 void test_chat_prompt() {
