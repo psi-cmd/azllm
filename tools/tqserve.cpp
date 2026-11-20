@@ -440,10 +440,19 @@ int main(int argc, char ** argv) {
                     auto send = [&](const std::string & d) { return rsse ? rsse->feed(d) : msse ? msse->feed(d) : raw(d); };
                     auto run_stream = [&](const tqserve::ChatRequest & r, tqserve::StreamWriter & w) {
                         auto on_tokens = [&](const std::vector<uint32_t> & ids) { return w.update(ids); };
-                        return guarded([&] {
-                            return scheduler ? scheduler->submit_stream(r, on_tokens)
-                                             : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
-                        });
+                        auto once = [&] {
+                            return guarded([&] {
+                                return scheduler ? scheduler->submit_stream(r, on_tokens)
+                                                 : tqserve::decode_stream(tokenizer, model, r, slot_context, on_tokens);
+                            });
+                        };
+                        auto res = once();
+                        for (int k = 0; k < tqserve::kEmptyAnswerRetries && tqserve::retry_empty_answer(r, res) && w.silent(); ++k) {
+                            std::cerr << "tqserve: empty answer (the first token ended the turn), sampling again\n";
+                            w.restart();
+                            res = once();
+                        }
+                        return res;
                     };
                     if (parsed.thinking && parsed.thinking_budget > 0 && static_cast<uint32_t>(parsed.thinking_budget) < parsed.max_tokens) {
                         auto phase1 = parsed;  // thinking budget, streamed: phase 1 deltas, then phase 2 continues the answer
@@ -534,7 +543,15 @@ int main(int argc, char ** argv) {
                     return;
                 } else {
                     auto run = [&](const tqserve::ChatRequest & r) {
-                        return guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); });
+                        auto once = [&] {
+                            return guarded([&] { return scheduler ? scheduler->submit(r) : tqserve::decode(tokenizer, model, r, slot_context); });
+                        };
+                        auto res = once();
+                        for (int k = 0; k < tqserve::kEmptyAnswerRetries && tqserve::retry_empty_answer(r, res); ++k) {
+                            std::cerr << "tqserve: empty answer (the first token ended the turn), sampling again\n";
+                            res = once();
+                        }
+                        return res;
                     };
                     tqserve::DecodeResult generated;
                     if (parsed.thinking && parsed.thinking_budget > 0 && static_cast<uint32_t>(parsed.thinking_budget) < parsed.max_tokens) {

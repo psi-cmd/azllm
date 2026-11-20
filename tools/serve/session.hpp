@@ -524,6 +524,16 @@ struct DecodeResult {
 
 inline void extract_tool_calls(DecodeResult & r);
 
+// An answer that ended on its first token with nothing in it: the end-of-turn marker was sampled first. After a tool
+// result that leaves an agent client (pi) waiting for a turn that never came - seen in ~1 of 80 agent requests with
+// Qwen3.8 27B at T=0.6 - and the prompt is cached, so sampling again costs about one forward pass. Greedy or seeded
+// requests would only repeat it.
+constexpr int kEmptyAnswerRetries = 2;
+inline bool retry_empty_answer(const ChatRequest & req, const DecodeResult & r) {
+    return req.temperature > 0.f && req.seed == 0 && r.error.empty() && r.finish_reason == "stop" &&
+           r.completion_tokens <= 1 && r.text.empty() && r.reasoning.empty() && r.tool_calls.empty();
+}
+
 inline size_t tool_stream_limit(const std::string & t) {
     static const std::string markers[2] = {"<" "function=", "<" "tool_call>"};
     size_t end = t.size();
@@ -1147,6 +1157,9 @@ public:
         return end <= sc_.size() ? true : emit(r.text.substr(0, end), sc_, false, true);
     }
     void mark_role_sent() { role_sent_ = true; }
+    // nothing has gone to the client yet, so the answer can still be generated again (retry_empty_answer)
+    bool silent() const { return chunks_ == 0 && !role_sent_; }
+    void restart() { seen_ = 0, sr_.clear(), sc_.clear(), tool_sent_.clear(), tool_ids_.clear(); }
 
 private:
     std::string head() const {
@@ -1214,6 +1227,7 @@ private:
             if (!role_sent_) out += "\"role\":\"assistant\",";
             role_sent_ = true;
             out += "\"tool_calls\":[" + entry + "]},\"finish_reason\":null}]}";
+            ++chunks_;
             if (!send_("data: " + out + "\n\n")) return false;
         }
         return true;
@@ -1246,6 +1260,7 @@ private:
             out += ',';
         }
         out += "\"finish_reason\":null}]}";
+        ++chunks_;
         return send_("data: " + out + "\n\n");
     }
     const tqllm::Tokenizer & tok_;
@@ -1255,7 +1270,7 @@ private:
     Send send_;
     std::string created_, id_, sr_, sc_;  // id_: one per response, the same in every chunk
     std::vector<std::string> tool_sent_, tool_ids_;  // per streamed tool call: arguments sent so far, its id
-    size_t hold_ = 0, seen_ = 0;
+    size_t hold_ = 0, seen_ = 0, chunks_ = 0;  // chunks_: deltas sent so far
     bool role_sent_ = false;
 };
 

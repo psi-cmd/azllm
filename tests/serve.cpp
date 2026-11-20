@@ -203,6 +203,23 @@ void test_tool_stream_limit() {
         check(mid.size() == 1 && mid[0].args.find("print(\\\"hi\\\")") != std::string::npos,
               "tools: a string value streams while it is generated");
     }
+    {  // an answer whose first token ended the turn is sampled again, but only when sampling could change it
+        tqserve::ChatRequest q;
+        q.temperature = 0.6f;
+        tqserve::DecodeResult e;
+        e.finish_reason = "stop", e.completion_tokens = 1;
+        check(tqserve::retry_empty_answer(q, e), "empty: a one-token empty answer is retried");
+        tqserve::DecodeResult t = e; t.text = "ok";
+        tqserve::DecodeResult c = e; c.tool_calls.push_back({});
+        tqserve::DecodeResult l = e; l.finish_reason = "length";
+        tqserve::DecodeResult n = e; n.completion_tokens = 2;
+        check(!tqserve::retry_empty_answer(q, t) && !tqserve::retry_empty_answer(q, c) && !tqserve::retry_empty_answer(q, l) &&
+                  !tqserve::retry_empty_answer(q, n),
+              "empty: text, tool calls, a length stop or a longer answer are kept");
+        tqserve::ChatRequest g = q; g.temperature = 0.f;
+        tqserve::ChatRequest s = q; s.seed = 7;
+        check(!tqserve::retry_empty_answer(g, e) && !tqserve::retry_empty_answer(s, e), "empty: greedy and seeded answers are not retried");
+    }
     {  // cache reads in OpenAI's usage field (agent clients read cache hits only there)
         tqserve::DecodeResult r;
         r.text = "ok", r.prompt_tokens = 100, r.completion_tokens = 2, r.cached_tokens = 96;
