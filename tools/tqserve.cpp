@@ -281,6 +281,7 @@ int main(int argc, char ** argv) {
         minfo.n_ctx = slot_context;  // per slot: llama.cpp reports the runtime context for the same reason
         minfo.slots = np;
         minfo.max_tokens = max_tokens;
+        minfo.vision = vis.enc != nullptr;
         minfo.kv = engine.kv.empty() ? engine.cache_k + "/" + engine.cache_v : engine.kv;
         minfo.kv_store = engine.kv_store;
         minfo.draft = engine.draft_model;

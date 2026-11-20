@@ -31,6 +31,7 @@ struct ModelInfo {
     std::vector<std::pair<std::string, uint64_t>> weight_types;  // format name -> tensors, e.g. TQ4: 400
     // tqllm runtime facts, kept in their own JSON object so no client can read them as llama.cpp fields
     uint32_t slots = 1, max_tokens = 0;
+    bool vision = false;  // --mmproj loaded: image input (architecture.input_modalities, /props modalities)
     std::string prompt_cache = "off", cache_active = "off", reasoning = "off", effort, kv, kv_store, draft;
 };
 
@@ -129,8 +130,9 @@ inline std::string models_json(const ModelInfo & m) {
     jstr(o, m.id);
     o += ",\"aliases\":[";
     jstr(o, m.id);
-    o += "],\"tags\":[],\"object\":\"model\",\"architecture\":{\"input_modalities\":[\"text\"],"
-         "\"output_modalities\":[\"text\"]},\"created\":";
+    o += "],\"tags\":[],\"object\":\"model\",\"architecture\":{\"input_modalities\":[\"text\"";
+    if (m.vision) o += ",\"image\"";
+    o += "],\"output_modalities\":[\"text\"]},\"created\":";
     o += std::to_string(m.created);
     o += ",\"owned_by\":\"tqllm\",\"meta\":{\"vocab_type\":" + std::to_string(m.vocab_type);
     o += ",\"n_vocab\":" + std::to_string(m.n_vocab);
@@ -187,6 +189,7 @@ inline std::string props_json(const ModelInfo & m) {
     o += ",\"modelpath\":";
     jstr(o, m.path);
     o += ",\"n_ctx_train\":" + std::to_string(m.n_ctx_train);
+    o += std::string(",\"modalities\":{\"vision\":") + (m.vision ? "true" : "false") + ",\"audio\":false}";  // llama.cpp
     o += ",\"vocab\":{\"n_vocab\":" + std::to_string(m.n_vocab);
     o += ",\"vocab_type\":" + std::to_string(m.vocab_type);
     if (m.bos >= 0) o += ",\"bos_token_id\":" + std::to_string(m.bos);
