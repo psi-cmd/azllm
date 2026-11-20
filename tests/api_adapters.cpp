@@ -30,6 +30,44 @@ static std::vector<std::string> chat_chunks(bool tool) {
     return v;
 }
 
+// a tool call streamed in pieces: the opening entry (id, name, first arguments), then fragments under its index
+static std::vector<std::string> split_tool_chunks() {
+    return {
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\","
+        "\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\": \\\"py\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"thon3\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"}\"}}]},"
+        "\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+        "data: [DONE]\n\n"};
+}
+
+static void test_split_tool_stream() {
+    const std::string full = "{\\\"cmd\\\": \\\"python3\\\"}";  // as it appears inside a JSON string
+    {
+        std::string sent;
+        tqserve::ResponsesSse sse("tqllm", [&](const std::string & x) { sent += x; return true; });
+        CHECK(sse.begin());
+        for (const auto & c : split_tool_chunks()) CHECK(sse.feed(c));
+        size_t added = 0;
+        for (size_t p = 0; (p = sent.find("event: response.output_item.added", p)) != std::string::npos; ++p) ++added;
+        CHECK(added == 1);
+        CHECK(has(sent, "\"delta\": \"thon3\""));
+        CHECK(has(sent, "\"arguments\": \"" + full + "\""));  // arguments.done, item.done, completed carry the joined text
+        CHECK(sent.find("event: response.function_call_arguments.done") < sent.find("event: response.completed"));
+    }
+    {
+        std::string sent;
+        tqserve::MessagesSse sse("tqllm", [&](const std::string & x) { sent += x; return true; });
+        CHECK(sse.begin());
+        for (const auto & c : split_tool_chunks()) CHECK(sse.feed(c));
+        size_t starts = 0, deltas = 0;
+        for (size_t p = 0; (p = sent.find("event: content_block_start", p)) != std::string::npos; ++p) ++starts;
+        for (size_t p = 0; (p = sent.find("\"input_json_delta\"", p)) != std::string::npos; ++p) ++deltas;
+        CHECK(starts == 1 && deltas == 3);
+        CHECK(has(sent, "\"partial_json\": \"thon3\"") && has(sent, "\"stop_reason\": \"tool_use\""));
+    }
+}
+
 static void test_paths() {
     CHECK(tqserve::api_for_path("/v1/responses") == tqserve::Api::Responses);
     CHECK(tqserve::api_for_path("/v1/messages") == tqserve::Api::Messages);
@@ -153,6 +191,7 @@ static void test_messages() {
 
 int main() {
     test_paths();
+    test_split_tool_stream();
     test_responses_request();
     test_responses_answer();
     test_responses_stream(false);
