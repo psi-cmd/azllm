@@ -54,6 +54,7 @@ public:
         uint32_t at;
         int nx, ny;
         const float * emb;
+        uint64_t digest = 0;  // content hash: the prompt cache tells images apart by it (0: an image prompt is not reused)
     };
     void set_prompt_images(const std::vector<PromptImage> & images);
     void spec_begin(const std::vector<uint32_t> & prompt, uint32_t count, int draft);
