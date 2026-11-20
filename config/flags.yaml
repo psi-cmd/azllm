@@ -81,6 +81,26 @@ flags:
     kind: debug
     default: "-"
     doc: "DIR: write the first DFlash2 draft's per-layer states, drafter K/V and candidates to DIR (for tools/dflash2_train/compare_drafter.py)"
+  - name: TQLLM_GDN_PHASES
+    kind: debug
+    default: "-"
+    doc: "set: BW matrix-chunk GDN prefill times its phases (gdn_chunk_bw.cuh, debug)"
+  - name: TQLLM_GDN_TRACE
+    kind: debug
+    default: "-"
+    doc: "set: BW matrix-chunk GDN prefill prints its per-launch profile (gdn_chunk_bw.cuh, debug)"
+  - name: TQLLM_GDN_COMPENSATED
+    kind: debug
+    default: "-"
+    doc: "set: BW matrix-chunk GDN prefill uses compensated (Kahan) chunk sums (gdn_chunk_bw.cuh, experimental)"
+  - name: TQLLM_GDN_PRECOMP
+    kind: debug
+    default: "-"
+    doc: "set: BW matrix-chunk GDN prefill precomputes the chunk coefficient matrices (gdn_chunk_bw.cuh, experimental)"
+  - name: TQLLM_GDN_CHUNK_MIN
+    kind: debug
+    default: "-"
+    doc: "N (>= 16): BW builds run GDN prefill chunks of at least N tokens on the matrix-chunk path (opt-in until it passes the gfx936 gates; unset: never)"
   - name: TQLLM_DFLASH_SAMPLE
     kind: debug
     default: "on"

@@ -20,6 +20,11 @@ command-line options (`docs/CONFIG.md`).
 | `TQLLM_LOG_TIMINGS` | on | 0: no llama.cpp-style print_timing lines (per-request prefill / decode / total with draft acceptance, plus the 3 s n_gen pulse) |  |
 | `TQLLM_DEBUG` | off | comma list of diagnostics: memlog (device memory per load stage), profile (spec round phases), steps (decode step timings), stageprof (eager verify, per-stage time), matvec (kernel picks), tune (load-time tuner picks), prefill (progress), draft (first draft / accept decisions), tree_chain (tree verify as a chain), tree_greedy_only (sampled requests verify a chain, not a tree), tf_dump:FILE (teacher-forced argmax per prompt position), fakeq_k:N / fakeq_v:N (quantise-dequantise K / V to N bits) |  |
 | `TQLLM_DFLASH_DUMP` | - | DIR: write the first DFlash2 draft's per-layer states, drafter K/V and candidates to DIR (for tools/dflash2_train/compare_drafter.py) |  |
+| `TQLLM_GDN_PHASES` | - | set: BW matrix-chunk GDN prefill times its phases (gdn_chunk_bw.cuh, debug) |  |
+| `TQLLM_GDN_TRACE` | - | set: BW matrix-chunk GDN prefill prints its per-launch profile (gdn_chunk_bw.cuh, debug) |  |
+| `TQLLM_GDN_COMPENSATED` | - | set: BW matrix-chunk GDN prefill uses compensated (Kahan) chunk sums (gdn_chunk_bw.cuh, experimental) |  |
+| `TQLLM_GDN_PRECOMP` | - | set: BW matrix-chunk GDN prefill precomputes the chunk coefficient matrices (gdn_chunk_bw.cuh, experimental) |  |
+| `TQLLM_GDN_CHUNK_MIN` | - | N (>= 16): BW builds run GDN prefill chunks of at least N tokens on the matrix-chunk path (opt-in until it passes the gfx936 gates; unset: never) |  |
 | `TQLLM_DFLASH_SAMPLE` | on | 0: sampling requests draft the greedy DFlash2 chain (accepted with p(d)) instead of drawing each draft from the selector's softmax(score / T) and verifying with rejection sampling |  |
 
 ## Retired (the tool stops; use the replacement)
