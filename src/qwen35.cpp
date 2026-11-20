@@ -2024,7 +2024,7 @@ private:
     Buf v_rpos, mm_tab, mm_img;
     bool mm_chunk = false;
     size_t mm_img_rows = 0;
-    struct PendingImage { uint32_t at; int nx, ny; size_t row0; };
+    struct PendingImage { uint32_t at; int nx, ny; size_t row0; uint64_t digest; };
     std::vector<PendingImage> mm_pending;
     // v_pos rows [0, nseg) were just staged in h_pos: stage the RoPE copy (delta per segment) next to it
     void upload_rpos(int nseg, const std::function<int(int)> & delta) {
@@ -3869,8 +3869,27 @@ public:
             if (k != images.size()) throw std::runtime_error("image placeholders out of order or beyond the prompt");
             rdelta = int(P) - p;
         }
+        // The prompt cache compares keys, not tokens: every image cell is the same <|image_pad|> token, so a cell's key
+        // is derived from its image's content digest and its index (top bit set: no vocabulary id). Two prompts then
+        // share a prefix only if they share the images in it. An image without a digest keeps the request uncached.
+        bool keyed = true;
+        std::vector<uint32_t> key_buf;
+        if (!images.empty()) {
+            key_buf = prompt;
+            for (const auto & im : images) {
+                if (!im.digest) keyed = false;
+                const uint32_t nt = uint32_t(im.nx) * uint32_t(im.ny);
+                for (uint32_t r = 0; r < nt; ++r) {
+                    uint64_t z = im.digest + 0x9E3779B97F4A7C15ull * (uint64_t(r) + 1);  // splitmix64
+                    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                    key_buf[im.at + r] = 0x80000000u | uint32_t((z ^ (z >> 31)) & 0x7FFFFFFFu);
+                }
+            }
+        }
+        const std::vector<uint32_t> & key = images.empty() ? prompt : key_buf;
         // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
-        const uint32_t P0 = pc_on && images.empty() ? pc_match(prompt) : 0;
+        const uint32_t P0 = pc_on && keyed ? pc_match(key) : 0;
         last_pc = P0;
         // A request that shares nothing with the cached conversation - a title, a health probe, a one-shot
         // classification - must NOT evict it: pc_seq.assign() below would replace a 100K-token conversation with a
@@ -3888,20 +3907,23 @@ public:
         // Fire whenever the deep restore point was lost, not only on a total miss: a request that resumes at a
         // bookmark below the snapshot is a rewritten history too, just a partially paid one.
         if (pc_on && !pc_seq.empty() && !pc_protect && P0 < pc_snap) {
-            const uint32_t sh = common_prefix(pc_seq, prompt);
+            const uint32_t sh = common_prefix(pc_seq, key);
             std::fprintf(stderr, "tqllm: prompt cache: first difference at token %u (cached %zu, this prompt %u)\n",
                          sh, pc_seq.size(), P);
             if (sh && sh < P && sh < pc_seq.size()) {
                 const uint32_t b = sh > 24 ? sh - 24 : 0;
                 auto win = [&](const std::vector<uint32_t> & v) {
                     const uint32_t e = b + 48 < uint32_t(v.size()) ? b + 48 : uint32_t(v.size());
-                    std::string s = tokenizer.decode(std::vector<uint32_t>(v.begin() + b, v.begin() + e));
+                    std::vector<uint32_t> ids;
+                    for (uint32_t i = b; i < e; ++i)
+                        if (!(v[i] & 0x80000000u)) ids.push_back(v[i]);  // image cell keys are no tokens: left out
+                    std::string s = tokenizer.decode(ids);
                     for (auto & c : s) if (unsigned(c) < 32u || unsigned(c) == 127u) c = ' ';
                     if (s.size() > 200) s.resize(200);
                     return s;
                 };
                 std::fprintf(stderr, "tqllm:   cached  >%s<\n", win(pc_seq).c_str());
-                std::fprintf(stderr, "tqllm:   prompt  >%s<\n", win(prompt).c_str());
+                std::fprintf(stderr, "tqllm:   prompt  >%s<\n", win(key).c_str());
             }
         }
         if (!pc_protect) {
@@ -3927,7 +3949,7 @@ public:
             for (uint32_t i = P; i-- > P0 + 1 && i + kTail > P;)
                 if (prompt[i] == im_start_id) { bnd = i; break; }
         }
-        if (pc_on && !pc_protect) pc_seq.assign(prompt.begin(), prompt.end());
+        if (pc_on && !pc_protect) pc_seq.assign(key.begin(), key.end());
         if (kv_cmp && opt.kv_compact_turn && cmp_pos) cmp_reset();  // --kv-compact-at turn: the new tokens see exact KV
         // Queue prefill chunks on one stream and read back only the final next token.
         uint32_t next = 0;
@@ -4748,7 +4770,7 @@ public:
         for (const auto & im : ims) {
             const size_t nt = size_t(im.nx) * size_t(im.ny);
             tqllm_cuda::f32_to_bf16(im.emb, mm_img.as<bf16>() + r0 * size_t(H), int64_t(nt) * H, stream);
-            mm_pending.push_back({im.at, im.nx, im.ny, r0});
+            mm_pending.push_back({im.at, im.nx, im.ny, r0, im.digest});
             r0 += nt;
         }
         sync_ck();

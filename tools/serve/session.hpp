@@ -17,7 +17,9 @@
 #include <ctime>
 #include <functional>
 #include <iostream>
+#include <list>
 #include <memory>
+#include <unordered_map>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -674,12 +676,59 @@ inline void set_timings(DecodeResult & r, const uint64_t * st) {
     print_timing(r, st[0]);
 }
 
+// FNV-1a 64 of an image's base64 payload: the prompt cache's image key and the embedding cache's (never 0).
+inline uint64_t image_digest(const std::string & s, size_t from) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = from; i < s.size(); ++i) h = (h ^ uint8_t(s[i])) * 0x100000001b3ull;
+    return h ? h : 1;
+}
+
+// Encoded images by digest (host memory, least recently used dropped past the budget). Every request re-sends the
+// conversation's images; without this each of them went through the encoder again on every turn.
+class ImageEmbeddingCache {
+public:
+    struct Entry {
+        int nx = 0, ny = 0;
+        std::vector<float> emb;
+    };
+    explicit ImageEmbeddingCache(size_t budget_bytes = 0) : budget_(budget_bytes) {}
+    void set_budget(size_t b) { budget_ = b; trim(); }
+    const Entry * find(uint64_t d) {
+        const auto it = map_.find(d);
+        if (it == map_.end()) return nullptr;
+        lru_.splice(lru_.begin(), lru_, it->second);
+        return &it->second->second;
+    }
+    void put(uint64_t d, Entry e) {
+        if (!budget_ || e.emb.size() * sizeof(float) > budget_ || map_.count(d)) return;
+        bytes_ += e.emb.size() * sizeof(float);
+        lru_.emplace_front(d, std::move(e));
+        map_[d] = lru_.begin();
+        trim();
+    }
+    size_t bytes() const { return bytes_; }
+    size_t size() const { return map_.size(); }
+
+private:
+    void trim() {
+        while (bytes_ > budget_ && !lru_.empty()) {
+            bytes_ -= lru_.back().second.emb.size() * sizeof(float);
+            map_.erase(lru_.back().first);
+            lru_.pop_back();
+        }
+    }
+    size_t budget_ = 0, bytes_ = 0;
+    std::list<std::pair<uint64_t, Entry>> lru_;
+    std::unordered_map<uint64_t, std::list<std::pair<uint64_t, Entry>>::iterator> map_;
+};
+
 // Server-wide vision encoder (--mmproj); requests encode under the mutex (the encoder reuses its buffers).
 struct Vision {
     std::unique_ptr<tqllm::VisionEncoder> enc;
     std::mutex mu;
     cudaStream_t stream = nullptr;
     uint32_t pad_id = 0;  // <|image_pad|>
+    ImageEmbeddingCache cache;  // --image-cache-mb (under mu)
 };
 inline Vision *& vision() {
     static Vision * v = nullptr;
@@ -726,7 +775,7 @@ inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> 
     for (size_t i = 0; i < prompt.size(); ++i)
         if (prompt[i] == v->pad_id) pads.push_back(i);
     if (pads.size() != req.images.size()) return "image placeholders in the text do not match the images";
-    struct Enc { int nx, ny; float * d; };
+    struct Enc { int nx, ny; float * d; uint64_t digest; };
     std::vector<Enc> enc;
     auto owned = std::make_shared<std::vector<float *>>();
     images.mem = std::shared_ptr<void>(owned.get(), [owned](void *) {
@@ -738,18 +787,32 @@ inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> 
             const auto comma = url.find(',');
             if (url.rfind("data:", 0) != 0 || comma == std::string::npos || url.find(";base64") > comma)
                 return "image_url must be a base64 data: URI";
-            std::vector<uint8_t> bytes, rgb;
-            int w = 0, h = 0, nx = 0, ny = 0;
-            if (!base64_decode(url, comma + 1, bytes) || !tqllm::decode_image(bytes.data(), bytes.size(), rgb, w, h))
-                return "cannot decode image";
-            const float * e = v->enc->encode(v->enc->preprocess(rgb.data(), w, h), nx, ny);
+            const uint64_t digest = image_digest(url, comma + 1);
+            int nx = 0, ny = 0;
+            const float * src = nullptr;
+            cudaMemcpyKind kind = cudaMemcpyDeviceToDevice;
+            if (const auto * hit = v->cache.find(digest)) {
+                nx = hit->nx, ny = hit->ny, src = hit->emb.data(), kind = cudaMemcpyHostToDevice;
+            } else {
+                std::vector<uint8_t> bytes, rgb;
+                int w = 0, h = 0;
+                if (!base64_decode(url, comma + 1, bytes) || !tqllm::decode_image(bytes.data(), bytes.size(), rgb, w, h))
+                    return "cannot decode image";
+                src = v->enc->encode(v->enc->preprocess(rgb.data(), w, h), nx, ny);
+            }
             const size_t n = size_t(nx) * size_t(ny) * size_t(v->enc->embd());
             float * d = nullptr;
             if (cudaMalloc(&d, n * sizeof(float)) != cudaSuccess) return "out of device memory for image embeddings";
             owned->push_back(d);
-            cudaMemcpyAsync(d, e, n * sizeof(float), cudaMemcpyDeviceToDevice, v->stream);
+            cudaMemcpyAsync(d, src, n * sizeof(float), kind, v->stream);
+            if (kind == cudaMemcpyDeviceToDevice) {  // keep the new encoding for the next turn, which sends it again
+                ImageEmbeddingCache::Entry e{nx, ny, std::vector<float>(n)};
+                cudaMemcpyAsync(e.emb.data(), src, n * sizeof(float), cudaMemcpyDeviceToHost, v->stream);
+                if (cudaStreamSynchronize(v->stream) != cudaSuccess) return "vision encoder failed";
+                v->cache.put(digest, std::move(e));
+            }
             if (cudaStreamSynchronize(v->stream) != cudaSuccess) return "vision encoder failed";
-            enc.push_back({nx, ny, d});
+            enc.push_back({nx, ny, d, digest});
         }
     }
     std::vector<uint32_t> out;
@@ -758,7 +821,7 @@ inline std::string expand_images(const ChatRequest & req, std::vector<uint32_t> 
     for (size_t i = 0; i < prompt.size(); ++i) {
         if (k < pads.size() && i == pads[k]) {
             const auto & e = enc[k++];
-            images.spans.push_back({uint32_t(out.size()), e.nx, e.ny, e.d});
+            images.spans.push_back({uint32_t(out.size()), e.nx, e.ny, e.d, e.digest});
             out.insert(out.end(), size_t(e.nx) * size_t(e.ny), v->pad_id);
         } else {
             out.push_back(prompt[i]);

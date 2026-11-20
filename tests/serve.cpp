@@ -335,8 +335,31 @@ void test_sampling_numbers() {
     check(c.ok && c.top_k == 0 && c.seed == 0, "nullable optional sampling fields");
 }
 
+void test_image_cache() {
+    // digest: the base64 payload only (from the comma), never 0
+    const std::string a = "data:image/png;base64,AAAA", b = "data:image/jpeg;base64,AAAA", c = "data:image/png;base64,AAAB";
+    check(tqserve::image_digest(a, a.find(',') + 1) == tqserve::image_digest(b, b.find(',') + 1), "digest ignores the header");
+    check(tqserve::image_digest(a, a.find(',') + 1) != tqserve::image_digest(c, c.find(',') + 1), "digest tells payloads apart");
+    check(tqserve::image_digest(a, a.size()) != 0, "digest of nothing is not 0");
+    // LRU by bytes: 3 entries of 400 B in 1000 B keep the 2 most recently used
+    tqserve::ImageEmbeddingCache cache(1000);
+    auto entry = [](float v) { return tqserve::ImageEmbeddingCache::Entry{2, 5, std::vector<float>(100, v)}; };
+    cache.put(1, entry(1.f));
+    cache.put(2, entry(2.f));
+    check(cache.find(1) && cache.find(1)->emb[0] == 1.f, "hit returns the stored embedding");
+    cache.put(3, entry(3.f));  // evicts 2: 1 was used after it
+    check(cache.find(2) == nullptr && cache.find(1) && cache.find(3), "least recently used is dropped");
+    check(cache.size() == 2 && cache.bytes() == 800, "byte accounting");
+    cache.put(4, tqserve::ImageEmbeddingCache::Entry{1, 1, std::vector<float>(300)});  // larger than the budget
+    check(cache.find(4) == nullptr && cache.size() == 2, "an entry over the budget is not kept");
+    tqserve::ImageEmbeddingCache off;
+    off.put(1, entry(1.f));
+    check(off.find(1) == nullptr, "budget 0 keeps nothing");
+}
+
 int main(int argc, char ** argv) {
     tqserve::serve_options().repeat_limit = 6;
+    test_image_cache();
     test_sampling_numbers();
     test_repeat_guard();
     test_split();
