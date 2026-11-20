@@ -181,10 +181,16 @@ inline std::string new_id(const char * prefix) {
 }
 // chat answers number tool calls call_0, call_1 per answer; agent clients need ids unique across the conversation
 inline std::string unique_call(const std::string & chat_id) { return new_id("call") + "_" + chat_id; }
+// cache reads reported by the chat answer (usage.prompt_tokens_details.cached_tokens; part of prompt_tokens)
+inline double chat_cached(const Json * u) {
+    const Json * d = u ? field(*u, "prompt_tokens_details") : nullptr;
+    const Json * c = d ? field(*d, "cached_tokens") : nullptr;
+    return c ? c->num : 0;
+}
 inline Json resp_usage(const Json * u) {
     const double in = u ? field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0 : 0;
     const double outn = u ? field(*u, "completion_tokens") ? field(*u, "completion_tokens")->num : 0 : 0;
-    return O({{"input_tokens", N(in)}, {"input_tokens_details", O({{"cached_tokens", N(0)}})}, {"output_tokens", N(outn)},
+    return O({{"input_tokens", N(in)}, {"input_tokens_details", O({{"cached_tokens", N(chat_cached(u))}})}, {"output_tokens", N(outn)},
               {"output_tokens_details", O({{"reasoning_tokens", N(0)}})}, {"total_tokens", N(in + outn)}});
 }
 inline Json resp_object(const std::string & id, const std::string & model, const std::string & status, std::vector<Json> output,
@@ -298,6 +304,15 @@ private:
                       {"summary_index", N(0)}, {"text", S(reasoning_)}})) &&
                ev("response.output_item.done", O({{"output_index", N(rs_index_)}, {"item", output_[size_t(rs_index_)]}}));
     }
+    struct Call { std::string fid, call_id, name, args; int idx = -1; bool open = false; };
+    bool close_call(Call & c) {
+        using namespace adapt;
+        if (!c.open) return true;
+        c.open = false;
+        output_[size_t(c.idx)] = call_item(c.fid, c.call_id, c.name, c.args, "completed");
+        return ev("response.function_call_arguments.done", O({{"item_id", S(c.fid)}, {"output_index", N(c.idx)}, {"arguments", S(c.args)}})) &&
+               ev("response.output_item.done", O({{"output_index", N(c.idx)}, {"item", output_[size_t(c.idx)]}}));
+    }
     bool chunk(const tqllm::Json & d) {
         using namespace adapt;
         if (const auto * err = field(d, "error")) {
@@ -336,22 +351,33 @@ private:
                 }
                 if (const auto * calls = field(*dl, "tool_calls"); calls && calls->kind == Json::Array) {
                     if (!close_reasoning() || !close_text()) return false;
+                    // OpenAI stream shape: an entry with an id opens a call, later entries with its index add argument text
                     for (const auto & tc : calls->arr) {
                         const auto * fn = field(tc, "function");
-                        const std::string fid = new_id("fc"), call_id = unique_call(str_of(field(tc, "id"))),
-                                          name = fn ? str_of(field(*fn, "name")) : "", args = fn ? str_of(field(*fn, "arguments")) : "";
-                        const int idx = int(output_.size());
-                        output_.push_back(call_item(fid, call_id, name, args, "completed"));
-                        if (!ev("response.output_item.added", O({{"output_index", N(idx)}, {"item", call_item(fid, call_id, name, "", "in_progress")}})) ||
-                            !ev("response.function_call_arguments.delta", O({{"item_id", S(fid)}, {"output_index", N(idx)}, {"delta", S(args)}})) ||
-                            !ev("response.function_call_arguments.done", O({{"item_id", S(fid)}, {"output_index", N(idx)}, {"arguments", S(args)}})) ||
-                            !ev("response.output_item.done", O({{"output_index", N(idx)}, {"item", output_.back()}})))
+                        const auto * ix = field(tc, "index");
+                        const size_t k = ix && ix->kind == Json::Number ? size_t(ix->num) : calls_.size();
+                        const std::string args = fn ? str_of(field(*fn, "arguments")) : "";
+                        if (k >= calls_.size() || field(tc, "id") != nullptr) {
+                            if (k < calls_.size() && !close_call(calls_[k])) return false;
+                            if (k >= calls_.size()) calls_.resize(k + 1);
+                            Call & c = calls_[k];
+                            c = Call{new_id("fc"), unique_call(str_of(field(tc, "id"))), fn ? str_of(field(*fn, "name")) : "", "",
+                                     int(output_.size()), true};
+                            output_.push_back(Nul());
+                            if (!ev("response.output_item.added", O({{"output_index", N(c.idx)}, {"item", call_item(c.fid, c.call_id, c.name, "", "in_progress")}})))
+                                return false;
+                        }
+                        Call & c = calls_[k];
+                        if (args.empty() || !c.open) continue;
+                        c.args += args;
+                        if (!ev("response.function_call_arguments.delta", O({{"item_id", S(c.fid)}, {"output_index", N(c.idx)}, {"delta", S(args)}})))
                             return false;
                     }
                 }
             }
             if (const auto * fr = field(*ch, "finish_reason"); fr && fr->kind == Json::String) {
                 if (!close_reasoning() || !close_text()) return false;
+                for (auto & c : calls_) if (!close_call(c)) return false;
                 std::vector<Json> out;
                 for (auto & o : output_) if (o.kind != Json::Null) out.push_back(o);
                 const bool cut = fr->str == "length";
@@ -365,6 +391,7 @@ private:
     Send send_;
     std::string id_, msg_id_, rs_id_, text_, reasoning_;
     std::vector<tqllm::Json> output_;
+    std::vector<Call> calls_;  // by the chat stream's tool_calls index
     int msg_index_ = -1, rs_index_ = -1;
     unsigned long long seq_ = 0;
     bool text_open_ = false, reasoning_open_ = false, failed_ = false;
@@ -461,8 +488,10 @@ inline std::string stop_reason(const std::string & finish, bool tools) {
     if (tools || finish == "tool_calls") return "tool_use";
     return finish == "length" ? "max_tokens" : "end_turn";
 }
+// Anthropic counts cache reads apart from input_tokens (input_tokens + cache_read_input_tokens = the whole prompt)
 inline Json anthropic_usage(const Json * u) {
-    return O({{"input_tokens", N(u && field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0)},
+    const double in = u && field(*u, "prompt_tokens") ? field(*u, "prompt_tokens")->num : 0, cached = chat_cached(u);
+    return O({{"input_tokens", N(in > cached ? in - cached : 0)}, {"cache_read_input_tokens", N(cached)},
               {"output_tokens", N(u && field(*u, "completion_tokens") ? field(*u, "completion_tokens")->num : 0)}});
 }
 inline Json tool_input(const std::string & args) {
@@ -574,16 +603,24 @@ private:
                     return false;
             }
             if (const auto * calls = field(*dl, "tool_calls"); calls && calls->kind == Json::Array)
+                // an entry with an id opens a tool_use block; later entries of the same index add to its input JSON
                 for (const auto & tc : calls->arr) {
                     const auto * fn = field(tc, "function");
+                    const auto * ix = field(tc, "index");
+                    const int k = ix && ix->kind == Json::Number ? int(ix->num) : tool_index_ + 1;
                     tools_ = true;
-                    if (!close_block()) return false;
-                    open_ = "tool";
-                    ++idx_;
-                    if (!ev("content_block_start", O({{"index", N(idx_)}, {"content_block", O({{"type", S("tool_use")},
-                                {"id", S("toolu_" + unique_call(str_of(field(tc, "id"))))}, {"name", S(fn ? str_of(field(*fn, "name")) : "")}, {"input", O({})}})}})) ||
-                        !ev("content_block_delta", O({{"index", N(idx_)}, {"delta", O({{"type", S("input_json_delta")},
-                                {"partial_json", S(fn ? str_of(field(*fn, "arguments")) : "")}})}})))
+                    if (k != tool_index_ || field(tc, "id") != nullptr) {
+                        if (!close_block()) return false;
+                        open_ = "tool";
+                        tool_index_ = k;
+                        ++idx_;
+                        if (!ev("content_block_start", O({{"index", N(idx_)}, {"content_block", O({{"type", S("tool_use")},
+                                    {"id", S("toolu_" + unique_call(str_of(field(tc, "id"))))}, {"name", S(fn ? str_of(field(*fn, "name")) : "")}, {"input", O({})}})}})))
+                            return false;
+                    }
+                    const std::string args = fn ? str_of(field(*fn, "arguments")) : "";
+                    if (!args.empty() && !ev("content_block_delta", O({{"index", N(idx_)}, {"delta", O({{"type", S("input_json_delta")},
+                                {"partial_json", S(args)}})}})))
                         return false;
                 }
         }
@@ -599,7 +636,7 @@ private:
     std::string model_;
     Send send_;
     std::string open_;
-    int idx_ = -1;
+    int idx_ = -1, tool_index_ = -1;  // tool_index_: chat-stream index of the open tool_use block
     bool tools_ = false;
 };
 

@@ -888,6 +888,17 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     return result;
 }
 
+// the JSON extract_tool_calls writes for one parameter value: JSON values as JSON, anything else as a string
+inline std::string tool_arg_json(const std::string & value) {
+    try {
+        const auto j = tqllm::parse_json(value);
+        if (j.kind != tqllm::Json::String) return dump(j);
+    } catch (const std::exception &) {}
+    std::string s;
+    jstr(s, value);
+    return s;
+}
+
 // [<tool_call>]\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>\n</tool_call>: values that parse as
 // JSON (numbers, booleans, objects, arrays) are kept as JSON, anything else becomes a string.
 inline void extract_tool_calls(DecodeResult & r) {
@@ -919,13 +930,7 @@ inline void extract_tool_calls(DecodeResult & r) {
             if (args.size() > 1) args += ", ";
             jstr(args, key);
             args += ": ";
-            bool as_json = false;
-            try {
-                const auto j = tqllm::parse_json(value);
-                as_json = j.kind != tqllm::Json::String;
-                if (as_json) args += dump(j);
-            } catch (const std::exception &) {}
-            if (!as_json) jstr(args, value);
+            args += tool_arg_json(value);
             p = ve == std::string::npos ? block.size() : ve;
         }
         call.arguments = args + "}";
@@ -935,6 +940,81 @@ inline void extract_tool_calls(DecodeResult & r) {
         r.text = trim(r.text.substr(0, first));
         r.finish_reason = "tool_calls";
     }
+}
+
+// A tool call while it is still being generated: `args` is the longest prefix of the `arguments` extract_tool_calls
+// will produce for it however the text goes on, so streamed fragments concatenate to the final arguments.
+struct PartialToolCall { std::string name, args; bool done = false; };
+
+// true when no continuation of the (newline-stripped) value `v` can parse as a non-string JSON value
+inline bool tool_value_is_string(const std::string & v) {
+    if (v.empty()) return false;
+    const char c = v[0];
+    for (const char * kw : {"true", "false", "null"}) {
+        if (c != kw[0]) continue;
+        const size_t n = std::strlen(kw), m = std::min(n, v.size());
+        if (v.compare(0, m, kw, m) != 0) return true;                                      // left the keyword
+        return v.size() > n && !std::isspace(static_cast<unsigned char>(v[n]));            // "trueX": trailing data
+    }
+    return !(c == '{' || c == '[' || c == '-' || (c >= '0' && c <= '9') || std::isspace(static_cast<unsigned char>(c)));
+}
+
+inline std::vector<PartialToolCall> partial_tool_calls(const std::string & text) {
+    std::vector<PartialToolCall> calls;
+    size_t at = text.find("<function=");
+    while (at != std::string::npos) {
+        const auto end = text.find("</function>", at);
+        const std::string block = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        const auto fe = block.find('>');
+        if (fe == std::string::npos) break;                     // name still coming
+        PartialToolCall call;
+        call.name = trim(block.substr(10, fe - 10));
+        call.done = end != std::string::npos;
+        std::string args = "{";
+        bool open = false;                                      // a value is still coming: nothing after it is known
+        size_t p = fe;
+        while ((p = block.find("<parameter=", p)) != std::string::npos) {
+            const auto pe = block.find('>', p);
+            if (pe == std::string::npos) { open = true; break; }
+            const std::string key = trim(block.substr(p + 11, pe - p - 11));
+            const auto ve = block.find("</parameter>", pe);
+            std::string value = block.substr(pe + 1, ve == std::string::npos ? std::string::npos : ve - pe - 1);
+            if (ve == std::string::npos && !call.done) {
+                // the leading newline is dropped only once seen; a trailing newline, a partial </parameter> and an
+                // unfinished UTF-8 sequence may still change
+                if (value.empty()) { open = true; break; }
+                if (value.front() == '\n') value.erase(0, 1);
+                for (size_t k = std::min(value.size(), size_t(11)); k > 0; --k)
+                    if (value.compare(value.size() - k, k, "</parameter>", 0, k) == 0) { value.resize(value.size() - k); break; }
+                if (!value.empty() && value.back() == '\n') value.pop_back();
+                for (size_t k = 1; k <= 3 && k <= value.size(); ++k) {
+                    const auto c = static_cast<unsigned char>(value[value.size() - k]);
+                    if ((c & 0xC0) == 0x80) continue;
+                    if ((c >= 0xF0 ? 4u : c >= 0xE0 ? 3u : c >= 0xC0 ? 2u : 1u) > k) value.resize(value.size() - k);
+                    break;
+                }
+                if (args.size() > 1) args += ", ";
+                jstr(args, key);
+                args += ": ";
+                if (tool_value_is_string(value)) { jstr(args, value); args.pop_back(); }  // open string: no closing quote
+                open = true;
+                break;
+            }
+            if (!value.empty() && value.front() == '\n') value.erase(0, 1);
+            if (!value.empty() && value.back() == '\n') value.pop_back();
+            if (args.size() > 1) args += ", ";
+            jstr(args, key);
+            args += ": ";
+            args += tool_arg_json(value);
+            p = ve == std::string::npos ? block.size() : ve;
+        }
+        if (!open && call.done) args += "}";
+        call.args = std::move(args);
+        calls.push_back(std::move(call));
+        if (end == std::string::npos) break;
+        at = text.find("<function=", end + 11);
+    }
+    return calls;
 }
 
 inline void usage_timings(std::string & out, const DecodeResult & result);
@@ -990,7 +1070,9 @@ inline std::string completion_json(const std::string & model, const DecodeResult
 inline void usage_timings(std::string & out, const DecodeResult & result) {
     out += ",\"usage\":{\"prompt_tokens\":" + std::to_string(result.prompt_tokens);
     out += ",\"completion_tokens\":" + std::to_string(result.completion_tokens);
-    out += ",\"total_tokens\":" + std::to_string(result.prompt_tokens + result.completion_tokens) + "}";
+    out += ",\"total_tokens\":" + std::to_string(result.prompt_tokens + result.completion_tokens);
+    // OpenAI's cache-read field (part of prompt_tokens): agent clients (pi, OpenAI SDK UIs) read cache hits only here
+    out += ",\"prompt_tokens_details\":{\"cached_tokens\":" + std::to_string(result.cached_tokens) + "}}";
     // llama.cpp-style engine timings; the first token comes from prefill, so decode rate = (n - 1) / decode time
     const uint32_t n = result.completion_tokens;
     auto num = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.3f", v); return std::string(b); };
@@ -1019,7 +1101,7 @@ public:
             DecodeResult r;
             finish(tok_, plain_, std::vector<uint32_t>(gen.begin(), gen.begin() + std::ptrdiff_t(k)), r);
             if (!emit(r.reasoning, sr_, true, false)) return false;
-            if (req_.tools) { if (!emit_tool_text(r.text, sc_)) return false; }
+            if (req_.tools) { if (!emit_tool_text(r.text, sc_) || !emit_tool_calls(r.text)) return false; }
             else if (!emit(r.text, sc_, false, false)) return false;
         }
         seen_ = std::max(seen_, gen.size());
@@ -1030,20 +1112,21 @@ public:
         std::string out = head() + "\"choices\":[{\"index\":0,";
         if (req_.chat) {
             out += "\"delta\":{";
-            if (!result.tool_calls.empty()) {
-                out += "\"tool_calls\":[";
-                for (size_t i = 0; i < result.tool_calls.size(); ++i) {
-                    if (i) out.push_back(',');
-                    out += "{\"index\":" + std::to_string(i) + ",\"id\":";
-                    jstr(out, result.tool_calls[i].id);
-                    out += ",\"type\":\"function\",\"function\":{\"name\":";
-                    jstr(out, result.tool_calls[i].name);
-                    out += ",\"arguments\":";
-                    jstr(out, result.tool_calls[i].arguments);
-                    out += "}}";
+            // calls already streamed get the rest of their arguments, the others go out whole
+            std::string calls;
+            for (size_t i = 0; i < result.tool_calls.size(); ++i) {
+                const auto & call = result.tool_calls[i];
+                if (i < tool_sent_.size()) {
+                    const std::string & sent = tool_sent_[i];
+                    if (call.arguments.compare(0, sent.size(), sent) != 0)
+                        std::cerr << "tqserve: streamed tool-call arguments diverged from the parsed call " << i << "\n";
+                    if (call.arguments.size() <= sent.size()) continue;
+                    tool_entry(calls, i, nullptr, call.arguments.substr(sent.size()));
+                } else {
+                    tool_entry(calls, i, &call, call.arguments);
                 }
-                out.push_back(']');
             }
+            if (!calls.empty()) out += "\"tool_calls\":[" + calls + "]";
             out += "},";
         } else {
             out += "\"text\":\"\",";
@@ -1087,6 +1170,54 @@ private:
         return 0;
     }
     static size_t tool_text_limit(const std::string & t) { return tool_stream_limit(t); }
+    // one entry of a delta's tool_calls: the first one of a call carries id, type and name (`head`), the rest only
+    // argument fragments under the same index
+    void tool_entry(std::string & out, size_t index, const ToolCall * head, const std::string & args) {
+        if (!out.empty()) out.push_back(',');
+        out += "{\"index\":" + std::to_string(index);
+        if (head) {
+            out += ",\"id\":";
+            jstr(out, index < tool_ids_.size() ? tool_ids_[index] : head->id);
+            out += ",\"type\":\"function\"";
+        }
+        out += ",\"function\":{";
+        if (head) {
+            out += "\"name\":";
+            jstr(out, head->name);
+            out += ',';
+        }
+        out += "\"arguments\":";
+        jstr(out, args);
+        out += "}}";
+    }
+    // tool calls as they are generated: a call goes out once its name is complete, then its arguments as they
+    // become certain (partial_tool_calls), so a client sees the call grow instead of a silent wait
+    bool emit_tool_calls(const std::string & text) {
+        if (!req_.chat || text.find("<function=") == std::string::npos) return true;
+        const auto calls = partial_tool_calls(text);
+        for (size_t i = 0; i < calls.size(); ++i) {
+            std::string entry;
+            if (i == tool_sent_.size()) {
+                ToolCall head;
+                head.name = calls[i].name;
+                tool_ids_.push_back(new_reply_id("call_"));
+                tool_sent_.emplace_back();
+                tool_entry(entry, i, &head, calls[i].args);
+            } else {
+                const std::string & sent = tool_sent_[i];
+                const std::string & args = calls[i].args;
+                if (args.size() <= sent.size() || args.compare(0, sent.size(), sent) != 0) continue;
+                tool_entry(entry, i, nullptr, args.substr(sent.size()));
+            }
+            tool_sent_[i] = calls[i].args;
+            std::string out = head() + "\"choices\":[{\"index\":0,\"delta\":{";
+            if (!role_sent_) out += "\"role\":\"assistant\",";
+            role_sent_ = true;
+            out += "\"tool_calls\":[" + entry + "]},\"finish_reason\":null}]}";
+            if (!send_("data: " + out + "\n\n")) return false;
+        }
+        return true;
+    }
     bool emit_tool_text(const std::string & raw, std::string & sent) {
         const size_t end = tool_text_limit(raw);
         return end <= sent.size() ? true : emit(raw.substr(0, end), sent, false, false);
@@ -1123,6 +1254,7 @@ private:
     std::string model_;
     Send send_;
     std::string created_, id_, sr_, sc_;  // id_: one per response, the same in every chunk
+    std::vector<std::string> tool_sent_, tool_ids_;  // per streamed tool call: arguments sent so far, its id
     size_t hold_ = 0, seen_ = 0;
     bool role_sent_ = false;
 };

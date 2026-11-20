@@ -166,6 +166,50 @@ void test_tool_stream_limit() {
                   r1.tool_calls[1].id != r2.tool_calls[1].id,
               "tools: call ids unique within and across answers");
     }
+    {  // streamed tool calls: at every byte prefix each partial call is a prefix of the final arguments and only grows
+        const std::vector<std::string> raws = {
+            "Let me write.\n<function=write>\n<parameter=path>\nsrc/a.py\n</parameter>\n<parameter=content>\n"
+            "print(\"hi\")\n\nx = {1: 2}\n\n</parameter>\n</function>",
+            "<function=f>\n<parameter=n>\n42\n</parameter>\n<parameter=flag>\ntrue\n</parameter>\n<parameter=s>\ntruth table\n"
+            "</parameter>\n<parameter=obj>\n{\"a\": [1, 2]}\n</parameter>\n<parameter=q>\n\"quoted\" text\n</parameter>\n</function>\n"
+            "<function=g>\n<parameter=text>\n\xE4\xB8\xAD\xE6\x96\x87 \xC3\xBCn </param not\n</parameter>\n</function>",
+            "<function=h>\n<parameter=x>\nnull pointer\n</parameter>\n<parameter=y>\nfalse\n",  // generation cut: no </function>
+        };
+        bool ok = true, grows = true;
+        for (const auto & raw : raws) {
+            tqserve::DecodeResult r;
+            r.text = raw;
+            tqserve::extract_tool_calls(r);
+            std::vector<std::string> prev;
+            for (size_t n = 0; n <= raw.size(); ++n) {
+                const auto calls = tqserve::partial_tool_calls(raw.substr(0, n));
+                if (calls.size() > r.tool_calls.size() || calls.size() < prev.size()) ok = false;
+                for (size_t i = 0; i < calls.size() && i < r.tool_calls.size(); ++i) {
+                    if (calls[i].name != r.tool_calls[i].name || r.tool_calls[i].arguments.compare(0, calls[i].args.size(), calls[i].args) != 0)
+                        ok = false, std::printf("  prefix %zu call %zu: %s\n", n, i, calls[i].args.c_str());
+                    if (i < prev.size() && calls[i].args.compare(0, prev[i].size(), prev[i]) != 0) grows = false;
+                }
+                prev.clear();
+                for (const auto & c : calls) prev.push_back(c.args);
+            }
+            const auto full = tqserve::partial_tool_calls(raw);
+            for (size_t i = 0; i < full.size(); ++i)
+                if (full[i].done && full[i].args != r.tool_calls[i].arguments) ok = false;  // a closed call is the parsed call
+        }
+        check(ok, "tools: streamed call arguments are prefixes of the parsed arguments");
+        check(grows, "tools: streamed call arguments only grow");
+        const std::string raw = raws[0], cut = raw.substr(0, raw.find("x = {"));
+        const auto mid = tqserve::partial_tool_calls(cut);
+        check(mid.size() == 1 && mid[0].args.find("print(\\\"hi\\\")") != std::string::npos,
+              "tools: a string value streams while it is generated");
+    }
+    {  // cache reads in OpenAI's usage field (agent clients read cache hits only there)
+        tqserve::DecodeResult r;
+        r.text = "ok", r.prompt_tokens = 100, r.completion_tokens = 2, r.cached_tokens = 96;
+        const std::string j = tqserve::completion_json("m", r, true);
+        check(j.find("\"total_tokens\":102,\"prompt_tokens_details\":{\"cached_tokens\":96}}") != std::string::npos,
+              "usage: prompt_tokens_details.cached_tokens");
+    }
 }
 
 void test_chat_prompt() {

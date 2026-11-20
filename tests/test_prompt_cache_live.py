@@ -13,7 +13,7 @@ URL = os.environ.get("TQSERVE_TEST_URL", "")
 FILLER = "The archive lists shipments by date, port and weight; most entries repeat the same three carriers. " * 40
 
 
-def ask(msgs, max_tokens=64):
+def ask_full(msgs, max_tokens=64):
     body = {"model": "x", "max_tokens": max_tokens, "temperature": 0, "messages": msgs,
             "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(URL.rstrip("/") + "/v1/chat/completions", json.dumps(body).encode(),
@@ -21,7 +21,12 @@ def ask(msgs, max_tokens=64):
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=900) as r:
         m = json.load(r)
-    return m["choices"][0]["message"]["content"] or "", time.time() - t0
+    return m, time.time() - t0
+
+
+def ask(msgs, max_tokens=64):
+    m, dt = ask_full(msgs, max_tokens)
+    return m["choices"][0]["message"]["content"] or "", dt
 
 
 @unittest.skipUnless(URL, "requires a running tqserve with prompt reuse (TQSERVE_TEST_URL)")
@@ -37,6 +42,25 @@ class PromptCache(unittest.TestCase):
         self.assertEqual(warm, cold, "reused-prefix answer differs from the full-prefill answer")
         self.assertIn("5172", warm)
         print("follow-up %.2f s with reuse, %.2f s without" % (t_warm, t_cold))
+
+    def test_rewind_after_many_short_turns(self):
+        # An agent loop: a long start, then many short turns, each a request that saves a snapshot. A compaction summary
+        # then resends the history up to a message well before the end. The snapshots must still reach back there:
+        # evicting the oldest kept only the last 16 turns, and the rewind re-read everything.
+        msgs = [{"role": "user", "content": FILLER * 3 + "\nRead the archive, then answer each step briefly."}]
+        turns = []
+        for i in range(24):
+            a, _ = ask(msgs, max_tokens=24)
+            msgs = msgs + [{"role": "assistant", "content": a},
+                           {"role": "user", "content": ("Step %d: note this log line. " % i) + FILLER[:600]}]
+            turns.append(len(msgs))
+        ask(msgs, max_tokens=24)
+        cut = msgs[:turns[5]] + [{"role": "user", "content": "Summarize the conversation above in one sentence."}]
+        m, dt = ask_full(cut, max_tokens=32)
+        u = m["usage"]
+        cached = u.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        print("rewind: %d of %d prompt tokens reused, %.2f s" % (cached, u["prompt_tokens"], dt))
+        self.assertGreater(cached, u["prompt_tokens"] // 2, "the rewind found no snapshot near the cut")
 
 
 if __name__ == "__main__":
