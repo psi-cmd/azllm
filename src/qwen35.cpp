@@ -5,6 +5,8 @@
 #include "engine.hpp"
 #include <random>
 #include <atomic>
+#include <cstdlib>
+#include <fstream>
 #include "json.hpp"
 #include "qwen2_kernels.cuh"
 #include "gguf.hpp"
@@ -3849,7 +3851,19 @@ public:
         // Device-resident body (positions in d_pos, tokens / anchor in d_tok): with the K/V ring the kernel grids do not
         // depend on pos, so the whole draft is captured once as a CUDA graph and replayed.
         const bool subset = mtp.draft_head.p != nullptr && !dsub_rows;
-        const bool graph = dfl.ring > 0 && !subset;
+        // TQLLM_DFLASH_DUMP=DIR: write the first draft's per-layer block states, drafter K/V and candidates to DIR (debug;
+        // compared against the reference drafter by tools/dflash2_train/compare_drafter.py)
+        static const char * dump_dir = std::getenv("TQLLM_DFLASH_DUMP");
+        static bool dumped = false;
+        const bool dump = dump_dir && !dumped && !launch_only;
+        const bool graph = dfl.ring > 0 && !subset && !dump;
+        auto dump_dev = [&](const std::string & name, const void * p, size_t bytes) {
+            if (!dump) return;
+            std::vector<char> h(bytes);
+            sync_ck();
+            ck(cudaMemcpy(h.data(), p, bytes, cudaMemcpyDeviceToHost));
+            std::ofstream(std::string(dump_dir) + "/" + name, std::ios::binary).write(h.data(), std::streamsize(bytes));
+        };
         auto body = [&] {
         if (dfl.dspark) {
             dspark_forward(pos);
@@ -3859,6 +3873,7 @@ public:
         auto *T = v_in.as<bf16>(), *O = v_o.as<bf16>(), *Q = v_q.as<bf16>(), *ACT = v_act.as<bf16>();
         auto *DYN = d_dyn.as<bf16>(), *DYNF = d_dynf.as<bf16>();
         embed_multi(d_tok.as<uint32_t>(), B, X);
+        dump_dev("embed.bf16", X, size_t(B) * H * 2);
         uint32_t bucket = 256;
         while (bucket < pos + B) bucket *= 2;
         bucket = std::min(bucket, context_);
@@ -3898,9 +3913,19 @@ public:
                                              d_pos.as<int>(), B, int(bucket), dfl.heads, dfl.kvheads,
                                              1.f / std::sqrt(float(dfl.hd)), false, dfl.window, stream, dfl.ring);
             }
+            if (dump) {
+                const std::string s = "l" + std::to_string(l) + ".";
+                dump_dev(s + "q.bf16", Q, size_t(B) * qd * 2);
+                dump_dev(s + "attn.bf16", O, size_t(B) * qd * 2);
+                if (dfl.ring == 0 || int(pos) + B <= dfl.ring) {  // rows 0 .. pos+B (no ring wrap yet)
+                    dump_dev(s + "kc.bf16", dfl_kc[l].p, size_t(pos + B) * kd * 2);
+                    dump_dev(s + "vc.bf16", dfl_vc[l].p, size_t(pos + B) * kd * 2);
+                }
+            }
             mmx(L.wo, O, A, B);
             tqllm_cuda::dflash_conv(A, DYN, cr, L.attn_conv_base, 1, Bb, B, H, dfl.group, stream);
             tqllm_cuda::residual(Bb, R, B * H, stream);  // Bb = ffn_inp
+            dump_dev("l" + std::to_string(l) + ".mid.bf16", Bb, size_t(B) * H * 2);
             tqllm_cuda::rms_f_multi(Bb, H, 0, L.ffn_norm, A, H, 0, H, 1, B, cfg.eps, stream);
             mmx(L.conv_ffn, A, DYNF, B);
             tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 0, X, B, H, dfl.group, stream);
@@ -3909,9 +3934,11 @@ public:
             mmx(L.down, ACT, A, B);
             tqllm_cuda::dflash_conv(A, DYNF, cr, L.ffn_conv_base, 1, X, B, H, dfl.group, stream);
             tqllm_cuda::residual(X, Bb, B * H, stream);
+            dump_dev("l" + std::to_string(l) + ".out.bf16", X, size_t(B) * H * 2);
         }
         auto * TE = d_te.as<bf16>();
         tqllm_cuda::rms_f_multi(X, H, 0, dfl.out_norm, TE, H, 0, H, 1, B, cfg.eps, stream);
+        dump_dev("final.bf16", TE, size_t(B) * H * 2);
         // logits (draft vocabulary head if configured), top-16 per position
         int head_rows;
         if (subset) {  // draft vocabulary subset (Q6_K rows)
@@ -3979,7 +4006,7 @@ public:
         ck(cudaMemcpyAsync(score.data(), d_score.p, score.size() * 4, cudaMemcpyDeviceToHost, stream));
         sync_ck();
         std::vector<uint32_t> out;
-        const bool draw_q = sample_drafts() && sampling();
+        const bool draw_q = sample_drafts() && sampling() && !dump;
         gen.q_id.clear();
         gen.q_p.clear();
         int pred = 0;
@@ -4001,6 +4028,21 @@ public:
                 pred = int(std::max_element(row, row + 16) - row);
             }
             out.push_back(idx[size_t(i) * 16 + pred]);
+        }
+        if (dump) {
+            dumped = true;
+            std::vector<float> vals(size_t(B) * 16);
+            ck(cudaMemcpy(vals.data(), d_vals.p, vals.size() * 4, cudaMemcpyDeviceToHost));
+            const std::string d(dump_dir);
+            std::ofstream(d + "/cand_idx.u32", std::ios::binary).write(reinterpret_cast<const char *>(idx.data()), std::streamsize(idx.size() * 4));
+            std::ofstream(d + "/cand_val.f32", std::ios::binary).write(reinterpret_cast<const char *>(vals.data()), std::streamsize(vals.size() * 4));
+            std::ofstream(d + "/score.f32", std::ios::binary).write(reinterpret_cast<const char *>(score.data()), std::streamsize(score.size() * 4));
+            std::ofstream(d + "/meta.txt") << "pos " << pos << "\nanchor " << anchor << "\nblock " << B << "\nhidden " << H
+                                            << "\nqd " << qd << "\nkd " << kd << "\nring " << dfl.ring << "\nwindow " << dfl.window
+                                            << "\nsubset " << int(subset) << "\ndsub_rows " << dsub_rows << "\ndraft";
+            for (auto t : out) std::ofstream(d + "/meta.txt", std::ios::app) << ' ' << t;
+            std::ofstream(d + "/meta.txt", std::ios::app) << '\n';
+            std::fprintf(stderr, "tqllm: DFlash2 draft dumped to %s (pos %u, anchor %u)\n", dump_dir, pos, anchor);
         }
         if (idx_out) *idx_out = std::move(idx);
         if (score_out) *score_out = std::move(score);

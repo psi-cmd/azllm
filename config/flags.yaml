@@ -77,6 +77,10 @@ flags:
     default: "-"
     doc: "removed"
     replaced_by: "fixed behaviour (settled A/B switch removed)"
+  - name: TQLLM_DFLASH_DUMP
+    kind: debug
+    default: "-"
+    doc: "DIR: write the first DFlash2 draft's per-layer states, drafter K/V and candidates to DIR (for tools/dflash2_train/compare_drafter.py)"
   - name: TQLLM_DFLASH_SAMPLE
     kind: debug
     default: "on"

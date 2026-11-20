@@ -28,6 +28,7 @@ inline constexpr Flag ALL[] = {
     {"TQLLM_DFLASH_BF16", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},
     {"TQLLM_DFLASH_I8H", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},
     {"TQLLM_DFLASH_NOGRAPH", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},
+    {"TQLLM_DFLASH_DUMP", Kind::Debug, "-", "DIR: write the first DFlash2 draft's per-layer states, drafter K/V and candidates to DIR (for tools/dflash2_train/compare_drafter.py)", ""},
     {"TQLLM_DFLASH_SAMPLE", Kind::Debug, "on", "0: sampling requests draft the greedy DFlash2 chain (accepted with p(d)) instead of drawing each draft from the selector's softmax(score / T) and verifying with rejection sampling", ""},
     {"TQLLM_DFLASH_TQ3", Kind::Retired, "-", "removed", "fixed behaviour (settled A/B switch removed)"},
     {"TQLLM_DRAFT_D", Kind::Retired, "-", "removed", "tqserve --draft-max N"},
