@@ -1,6 +1,8 @@
 #include "vision.hpp"
 
+#include "dequant.hpp"
 #include "gguf.hpp"
+#include "quant_kernels.cuh"
 #include "vision_kernels.cuh"
 
 #include <cublas_v2.h>
@@ -73,26 +75,59 @@ float f16_bits_to_f32(uint16_t b) {
     return __half2float(h);
 }
 
-// host FP32 copy of an F32 / F16 tensor
+// host FP32 copy of a tensor of any type dequantize_host reads (F32, F16, BF16, Q8_0, K-quants, ...)
 std::vector<float> host_f32(const GgufFile & f, const std::string & name, size_t expect) {
     const auto it = f.tensors.find(name);
     if (it == f.tensors.end()) throw std::runtime_error("mmproj: missing tensor " + name);
+    uint64_t n = 1;
+    for (const auto d : it->second.ne) n *= d;
+    if (n != expect) throw std::runtime_error("mmproj: unexpected size for " + name);
     const auto raw = f.read(it->second);
     std::vector<float> out(expect);
-    if (it->second.type == GGML_F32 && raw.size() == expect * 4) std::memcpy(out.data(), raw.data(), raw.size());
-    else if (it->second.type == GGML_F16 && raw.size() == expect * 2)
-        for (size_t i = 0; i < expect; ++i) {
-            uint16_t b;
-            std::memcpy(&b, raw.data() + 2 * i, 2);
-            out[i] = f16_bits_to_f32(b);
-        }
-    else throw std::runtime_error("mmproj: unexpected type or size for " + name);
+    dequantize_host(it->second.type, raw.data(), out.data(), int64_t(expect));
     return out;
 }
 
-struct Lin {  // y[n][out] = x[n][in] W^T + b; W F16 [out][in]
-    Dev w, b;
-    int in = 0, out = 0;
+// i8h (int8 + FP16 scale per 16, symmetric max-abs / 127): i8h_quantize on the host
+void quant_i8h(const std::vector<float> & w, std::vector<int8_t> & q, std::vector<uint16_t> & sc) {
+    q.resize(w.size());
+    sc.resize(w.size() / 16);
+    for (size_t g = 0; g < sc.size(); ++g) {
+        const float * x = w.data() + g * 16;
+        float m = 0.f;
+        for (int i = 0; i < 16; ++i) m = std::max(m, std::fabs(x[i]));
+        sc[g] = f32_to_f16_bits(m / 127.f);
+        const float s = f16_bits_to_f32(sc[g]);
+        for (int i = 0; i < 16; ++i)
+            q[g * 16 + i] = int8_t(s > 0.f ? std::clamp(int(std::nearbyint(x[i] / s)), -127, 127) : 0);
+    }
+}
+
+// u4h (4-bit codes in the group-of-16 nibble order of u4h_dequant_h, FP16 (scale, min) per 32), straight from the
+// weights: u4h_from_i8h would round twice.
+void quant_u4h(const std::vector<float> & w, std::vector<uint8_t> & q, std::vector<uint16_t> & sm) {
+    const size_t nb = w.size() / 32;
+    q.assign(nb * 16, 0);
+    sm.resize(nb * 2);
+    for (size_t b = 0; b < nb; ++b) {
+        const float * v = w.data() + b * 32;
+        float lo = v[0], hi = v[0];
+        for (int i = 1; i < 32; ++i) lo = std::min(lo, v[i]), hi = std::max(hi, v[i]);
+        sm[2 * b] = f32_to_f16_bits((hi - lo) / 15.f);
+        sm[2 * b + 1] = f32_to_f16_bits(lo);
+        const float s = f16_bits_to_f32(sm[2 * b]), m = f16_bits_to_f32(sm[2 * b + 1]);
+        uint8_t * out = q.data() + b * 16;
+        for (int e = 0; e < 32; ++e) {
+            const int c = s > 0.f ? std::clamp(int(std::nearbyint((v[e] - m) / s)), 0, 15) : 0;
+            const int grp = e / 16, ei = e % 16, u = ei / 4, j = ei % 4;
+            out[grp * 8 + (u / 2) * 4 + j] |= uint8_t(c << ((u % 2) * 4));
+        }
+    }
+}
+
+struct Lin {  // y[n][out] = x[n][in] W^T + b; W [out][in]: FP16 (bits 16), i8h (8) or u4h (4), the last two
+    Dev w, sc, b;  // dequantised to FP16 before each GEMM; sc: i8h scales / u4h (scale, min) pairs
+    int in = 0, out = 0, bits = 16;
 };
 
 struct Block {
@@ -102,7 +137,8 @@ struct Block {
 
 class Qwen3VL final : public VisionEncoder {
 public:
-    Qwen3VL(const GgufFile & f, cudaStream_t s) : st(s) {
+    Qwen3VL(const GgufFile & f, cudaStream_t s, int wbits_) : st(s), wbits(wbits_) {
+        if (wbits != 16 && wbits != 8 && wbits != 4) throw std::runtime_error("mmproj: weight bits must be 16, 8 or 4");
         if (f.kv.count("clip.projector_type") == 0 || f.kv.at("clip.projector_type").str != "qwen3vl_merger")
             throw std::runtime_error("mmproj: only projector qwen3vl_merger is supported");
         n_embd = int(f.num("clip.vision.embedding_length"));
@@ -154,12 +190,15 @@ public:
         post_b = up(host_f32(f, "v.post_ln.bias", n_embd));
         mm0 = lin(f, "mm.0", 4 * n_embd, 4 * n_embd);
         mm2 = lin(f, "mm.2", 4 * n_embd, proj);
+        if (wbits != 16) d_w = Dev(wmax * 2);
+        wbytes += d_w.n;
     }
     ~Qwen3VL() override {
         if (blas) cublasDestroy(blas);
     }
 
     int embd() const override { return proj; }
+    size_t weight_bytes() const override { return wbytes; }
     int align() const override { return patch * merge; }
     void set_token_limits(int mn, int mx) override {
         const int area = patch * patch * merge * merge;
@@ -305,12 +344,17 @@ private:
     std::vector<float> pos_tab;
     std::vector<Block> blk;
     Lin mm0, mm2;
+    int wbits = 16;
+    size_t wmax = 0;  // largest matrix (elements): d_w, the FP16 copy a quantised matrix is expanded into
+    size_t wbytes = 0;  // weight_bytes()
+    Dev d_w;
     int cap = 0;  // tokens the activation buffers hold
     Dev d_cols, d_pos, d_x, d_t, d_qkv, d_a, d_f, d_h, d_s, d_out;
     static constexpr int QB = 1024;  // attention query block (scores QB x N FP32)
 
     Dev up(const std::vector<float> & v) {
         Dev d(v.size() * 4);
+        wbytes += d.n;
         ck(cudaMemcpy(d.p, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
         return d;
     }
@@ -318,11 +362,33 @@ private:
         Lin L;
         L.in = in;
         L.out = out;
+        L.bits = wbits;
         const auto w = host_f32(f, p + ".weight", size_t(in) * out);
-        std::vector<uint16_t> h(w.size());
-        for (size_t i = 0; i < w.size(); ++i) h[i] = f32_to_f16_bits(w[i]);
-        L.w = Dev(h.size() * 2);
-        ck(cudaMemcpy(L.w.p, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
+        wmax = std::max(wmax, w.size());
+        auto put = [this](Dev & d, const void * src, size_t bytes) {
+            d = Dev(bytes);
+            wbytes += bytes;
+            ck(cudaMemcpy(d.p, src, bytes, cudaMemcpyHostToDevice));
+        };
+        if (wbits == 16) {
+            std::vector<uint16_t> h(w.size());
+            for (size_t i = 0; i < w.size(); ++i) h[i] = f32_to_f16_bits(w[i]);
+            put(L.w, h.data(), h.size() * 2);
+        } else if (wbits == 8) {
+            if (w.size() % 16) throw std::runtime_error("mmproj: " + p + " is not a multiple of 16 weights");
+            std::vector<int8_t> q;
+            std::vector<uint16_t> sc;
+            quant_i8h(w, q, sc);
+            put(L.w, q.data(), q.size());
+            put(L.sc, sc.data(), sc.size() * 2);
+        } else {
+            if (w.size() % 32) throw std::runtime_error("mmproj: " + p + " is not a multiple of 32 weights");
+            std::vector<uint8_t> q;
+            std::vector<uint16_t> sm;
+            quant_u4h(w, q, sm);
+            put(L.w, q.data(), q.size());
+            put(L.sc, sm.data(), sm.size() * 2);
+        }
         L.b = up(host_f32(f, p + ".bias", size_t(out)));
         return L;
     }
@@ -344,8 +410,16 @@ private:
     // y[n][out] = x[n][in] W^T + b (FP16 operands, FP32 accumulate and output), optional GELU
     void linear(const Lin & L, const float * x, float * y, int n, bool gelu) {
         tqllm_cuda::vis_f32_to_h(x, d_h.as<__half>(), int64_t(n) * L.in, st);
+        const void * W = L.w.p;
+        if (L.bits == 8) {
+            tqllm_cuda::i8h_dequant_h(L.w.as<int8_t>(), L.sc.as<__half>(), d_w.as<__half>(), L.out, L.in, st);
+            W = d_w.p;
+        } else if (L.bits == 4) {
+            tqllm_cuda::u4h_dequant_h(L.w.as<uint8_t>(), L.sc.as<__half2>(), d_w.as<__half>(), L.out, L.in, st);
+            W = d_w.p;
+        }
         const float one = 1.f, zero = 0.f;
-        cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, L.out, n, L.in, &one, L.w.p, CUDA_R_16F, L.in, d_h.p, CUDA_R_16F,
+        cb(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, L.out, n, L.in, &one, W, CUDA_R_16F, L.in, d_h.p, CUDA_R_16F,
                         L.in, &zero, y, CUDA_R_32F, L.out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         tqllm_cuda::vis_bias(y, L.b.as<float>(), n, L.out, gelu, st);
     }
@@ -370,9 +444,9 @@ private:
 
 }  // namespace
 
-std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string & mmproj, cudaStream_t stream) {
+std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string & mmproj, cudaStream_t stream, int weight_bits) {
     const GgufFile f = gguf_open(mmproj);
-    return std::make_unique<Qwen3VL>(f, stream);
+    return std::make_unique<Qwen3VL>(f, stream, weight_bits);
 }
 
 }  // namespace tqllm

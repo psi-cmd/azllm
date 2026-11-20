@@ -18,9 +18,12 @@ struct VisionImage {
 
 class VisionEncoder {
 public:
-    static std::unique_ptr<VisionEncoder> load(const std::string & mmproj, cudaStream_t stream);
+    // weight_bits: the encoder's and merger's matrices on the device as FP16 (16), int8 + FP16 scale per 16 (8) or
+    // 4-bit + FP16 scale / min per 32 (4); quantised ones are expanded to FP16 one matrix at a time before each GEMM.
+    static std::unique_ptr<VisionEncoder> load(const std::string & mmproj, cudaStream_t stream, int weight_bits = 16);
     virtual ~VisionEncoder() = default;
     virtual int embd() const = 0;  // output width (the text model's hidden size)
+    virtual size_t weight_bytes() const = 0;  // device memory the weights hold (with the FP16 expansion buffer)
     virtual int align() const = 0;  // patch * merge: input pixels per output token along each axis
     // token budget per image (llama.cpp image_min_tokens / image_max_tokens)
     virtual void set_token_limits(int min_tokens, int max_tokens) = 0;
