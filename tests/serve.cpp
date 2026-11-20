@@ -4,6 +4,7 @@
 // (spawns the listener on a loopback port, fires one request, checks the reply);
 // skipped silently when the flag is absent so a CI host can run the pure tests.
 #include "serve/http.hpp"
+#include "serve/model_info.hpp"
 #include "tools/serve/session.hpp"
 
 #include <cassert>
@@ -357,9 +358,23 @@ void test_image_cache() {
     check(off.find(1) == nullptr, "budget 0 keeps nothing");
 }
 
+void test_modalities() {
+    // image input is announced only with a vision encoder (--mmproj)
+    tqserve::ModelInfo m;
+    m.id = "x";
+    const auto text = tqserve::models_json(m), text_props = tqserve::props_json(m);
+    check(text.find("\"input_modalities\":[\"text\"]") != std::string::npos, "text-only input_modalities");
+    check(text_props.find("\"modalities\":{\"vision\":false") != std::string::npos, "props without vision");
+    m.vision = true;
+    check(tqserve::models_json(m).find("\"input_modalities\":[\"text\",\"image\"]") != std::string::npos,
+          "input_modalities with image");
+    check(tqserve::props_json(m).find("\"modalities\":{\"vision\":true") != std::string::npos, "props with vision");
+}
+
 int main(int argc, char ** argv) {
     tqserve::serve_options().repeat_limit = 6;
     test_image_cache();
+    test_modalities();
     test_sampling_numbers();
     test_repeat_guard();
     test_split();
