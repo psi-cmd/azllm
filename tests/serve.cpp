@@ -358,6 +358,115 @@ void test_image_cache() {
     check(off.find(1) == nullptr, "budget 0 keeps nothing");
 }
 
+void test_thinking_loop_guard() {
+    constexpr uint32_t END = 7777;  // </think>
+    auto cycle = [](size_t len, size_t reps, uint32_t base) {  // `reps` copies of a `len`-token sentence
+        std::vector<uint32_t> v;
+        for (size_t r = 0; r < reps; ++r)
+            for (size_t i = 0; i < len; ++i) v.push_back(base + uint32_t(i));
+        return v;
+    };
+    auto run = [](tqserve::RepeatGuard & g, const std::vector<uint32_t> & ids, size_t step) {  // grows like spec steps
+        for (size_t n = step; ; n += step) {
+            const std::vector<uint32_t> part(ids.begin(), ids.begin() + std::ptrdiff_t(std::min(n, ids.size())));
+            if (g.check(part)) return part.size();
+            if (n >= ids.size()) return size_t(0);
+        }
+    };
+    const size_t budget = tqserve::serve_options().think_loop;
+    constexpr size_t S = tqserve::kThinkLoopSpan;
+    // a loop of period p trips once `budget` tokens repeat text already written twice: at 2p + S - 1 + budget tokens
+    auto trip_at = [&](size_t p) { return 2 * p + S - 1 + budget; };
+    constexpr size_t L = S + 8;  // a 40-token sentence
+    {  // a sentence repeated: trips at its budget, inside the thinking
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        const size_t at = run(g, cycle(L, 40, 100), 7);
+        check(g.loop && at > 0, "a repeated sentence in the thinking trips the guard");
+        check(at >= trip_at(L) && at < trip_at(L) + 7, "a short loop trips once its copies pass the budget");
+    }
+    {  // just under the budget: no trip
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        check(run(g, cycle(L, (trip_at(L) - 1) / L, 100), 5) == 0 && !g.loop, "a short loop under the budget passes");
+    }
+    {  // a long loop (a 500-token paragraph) needs fewer copies: it trips inside its third copy
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        const size_t at = run(g, cycle(500, 4, 100), 11);
+        check(g.loop && at > 1000 && at <= 1500 && at >= trip_at(500), "a paragraph loop trips in its third copy");
+        tqserve::RepeatGuard g2;
+        g2.arm_thinking(END);
+        check(run(g2, cycle(500, 2, 100), 11) == 0, "a paragraph written twice passes (a draft and its rewrite)");
+    }
+    {  // a 40-token command quoted 8 times between other text: barely any copied text, no trip
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        std::vector<uint32_t> ids;
+        for (uint32_t q = 0; q < 8; ++q) {
+            for (uint32_t k = 0; k < 40; ++k) ids.push_back(300 + k);
+            for (uint32_t k = 0; k < 300; ++k) ids.push_back(10000 + q * 300 + k);
+        }
+        check(run(g, ids, 9) == 0 && !g.loop, "a command quoted a few times does not trip");
+    }
+    {  // data that repeats in short pieces (a hex dump: "00 00 00 00" between other bytes) is no loop
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        std::vector<uint32_t> ids;
+        for (uint32_t row = 0; row < 200; ++row) {
+            for (int k = 0; k < 4; ++k) ids.push_back(5);          // a run of zero bytes (under the test repeat limit)
+            for (uint32_t k = 0; k < 8; ++k) ids.push_back(2000 + row * 8 + k);  // then different bytes
+        }
+        check(run(g, ids, 8) == 0 && !g.loop, "short repeated data does not trip");
+    }
+    {  // the same repetition after </think> (the answer: tables, lists) is left alone
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        auto ids = cycle(L, 3, 100);
+        ids.push_back(END);
+        const auto tail = cycle(L, 40, 100);
+        ids.insert(ids.end(), tail.begin(), tail.end());
+        check(run(g, ids, 9) == 0 && !g.loop, "repetition after </think> does not trip");
+    }
+    {  // not armed (a request without thinking): no trip
+        tqserve::RepeatGuard g;
+        check(run(g, cycle(L, 40, 100), 9) == 0 && !g.loop, "an unarmed guard ignores repetition");
+    }
+    {  // varied thinking that reuses short phrases ("Let me", 4 tokens) many times: no trip
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        std::vector<uint32_t> ids;
+        for (uint32_t s = 0; s < 400; ++s) {
+            for (uint32_t w : {1u, 2u, 3u, 4u}) ids.push_back(w);           // a shared opening
+            for (uint32_t k = 0; k < 12; ++k) ids.push_back(1000 + s * 16 + k);  // then something new
+        }
+        check(run(g, ids, 8) == 0 && !g.loop, "shared short openings do not trip");
+    }
+    {  // off
+        const uint32_t saved = tqserve::serve_options().think_loop;
+        tqserve::serve_options().think_loop = 0;
+        tqserve::RepeatGuard g;
+        g.arm_thinking(END);
+        check(run(g, cycle(L, 40, 100), 9) == 0 && !g.loop, "--think-loop 0 turns it off");
+        tqserve::serve_options().think_loop = saved;
+    }
+    {  // merge_continuation: the answer and calls of the continuation, counts and timings of both
+        tqserve::DecodeResult a, b;
+        a.reasoning = "r";
+        a.completion_tokens = 300;
+        a.decode_ms = 10;
+        a.thinking_loop = true;
+        b.text = "answer";
+        b.tool_calls.push_back({"f", "{}"});
+        b.completion_tokens = 20;
+        b.decode_ms = 2;
+        b.finish_reason = "tool_calls";
+        tqserve::merge_continuation(a, b);
+        check(a.reasoning == "r" && a.text == "answer" && a.tool_calls.size() == 1 && a.completion_tokens == 320 &&
+              a.decode_ms == 12 && a.finish_reason == "tool_calls", "merge_continuation");
+    }
+}
+
 void test_modalities() {
     // image input is announced only with a vision encoder (--mmproj)
     tqserve::ModelInfo m;
@@ -375,6 +484,7 @@ int main(int argc, char ** argv) {
     tqserve::serve_options().repeat_limit = 6;
     test_image_cache();
     test_modalities();
+    test_thinking_loop_guard();
     test_sampling_numbers();
     test_repeat_guard();
     test_split();

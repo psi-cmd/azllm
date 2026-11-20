@@ -33,6 +33,7 @@ namespace tqserve {
 struct ServeOptions {
     int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: the drafter's default (DFlash2 7, DSpark 3)
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
+    uint32_t think_loop = 384;    // --think-loop N: N thinking tokens repeating text written twice before close it (0 = off)
     float top_p = 0.95f;        // --top-p F: nucleus over the scored candidates, the Qwen3.8 card value for both
                                 // modes; 1.0 = the old behaviour (sample the whole candidate set)
     int top_k = 0;              // --top-k N: 0 = all candidates the model scores (16); above 16 has no effect
@@ -59,13 +60,38 @@ inline std::function<size_t()> & free_mb_probe() {
     return f;
 }
 
+// Thinking loop: the model re-plans the same step over and over and never closes the thinking ("Let me use a bounded
+// poll ... Let me write the apply." 135 times, 10.8K tokens, no answer). A loop can be one sentence or a whole
+// paragraph, so the guard counts copied text, not copies: every thinking token whose kThinkLoopSpan-token span is at
+// its third or later occurrence. A loop of period p after n copies has about p * (n - 2) of them - the longer the
+// repeated part, the fewer copies it takes (at 384: ~12 copies of 40 tokens, 6 of 100, the third of 500) - while a
+// path or command quoted a few times adds next to nothing. Replayed over 2432 thinking turns of pi sessions with the
+// model's tokenizer, 384 closes 16 turns, all of them stuck (re-planning, "Actually, let me reconsider" circles), and
+// none of the turns that only quoted repetitive data (a hex / \x00 dump, a list of 18 mirrors of one repo path),
+// which a plain count of short spans closed too. When think_loop such tokens are reached the request stops with
+// thinking_loop set and tqserve continues the answer after a forced </think>.
+constexpr size_t kThinkLoopSpan = 32;
+
 struct RepeatGuard {
     uint32_t tok = 0, run = 0;
     size_t seen = 0;
+    // thinking loop (arm_thinking): span counts until </think>, and the tokens whose span was already seen twice
+    uint32_t think_end = UINT32_MAX;
+    bool thinking = false, loop = false;
+    std::unordered_map<uint64_t, uint32_t> spans;
+    uint32_t copied = 0;
+    void arm_thinking(uint32_t end_id) {
+        think_end = end_id;
+        thinking = serve_options().think_loop > 0;
+    }
     bool check(const std::vector<uint32_t> & ids) {  // ids: the generated ids so far, growing between calls
         const uint32_t limit = repeat_limit();
-        if (!limit) return false;
         for (; seen < ids.size(); ++seen) {
+            if (thinking && thinking_loop(ids, seen)) {
+                ++seen;
+                return true;
+            }
+            if (!limit) continue;
             if (seen && ids[seen] == tok) ++run;
             else tok = ids[seen], run = 1;
             if (run >= limit) {
@@ -77,7 +103,31 @@ struct RepeatGuard {
         }
         return false;
     }
+
+private:
+    bool thinking_loop(const std::vector<uint32_t> & ids, size_t i) {
+        if (ids[i] == think_end) {
+            thinking = false;
+            spans.clear();
+            copied = 0;
+            return false;
+        }
+        if (i + 1 < kThinkLoopSpan) return false;
+        uint64_t h = 1469598103934665603ull;  // FNV-1a over the span's ids
+        for (size_t k = i + 1 - kThinkLoopSpan; k <= i; ++k) h = (h ^ ids[k]) * 1099511628211ull;
+        if (++spans[h] < 3 || ++copied < serve_options().think_loop) return false;
+        fprintf(stderr, "tqserve: thinking loop: %u of %zu thinking tokens repeat text already written twice; closing "
+                        "the thinking\n", copied, i + 1);
+        loop = true;
+        return true;
+    }
 };
+
+// </think> as one id (UINT32_MAX when the tokenizer has no such token: the thinking-loop guard then never closes)
+inline uint32_t think_end_id(const tqllm::Tokenizer & tokenizer) {
+    static const auto ids = tokenizer.encode("</think>");
+    return ids.size() == 1 ? ids[0] : UINT32_MAX;
+}
 
 inline std::string trim(const std::string & x) {
     const auto a = x.find_first_not_of(" \t\r\n");
@@ -520,11 +570,29 @@ struct DecodeResult {
     double prefill_ms = 0, decode_ms = 0;
     uint64_t draft_n = 0, draft_accepted = 0;
     uint32_t cached_tokens = 0;  // reused from the prompt cache: prefill_ms covers only the tokens after them
+    bool thinking_loop = false;  // the thinking-loop guard stopped it inside the thinking (tqserve then closes the thinking)
     std::string finish_reason = "length";
     std::string error;
 };
 
 inline void extract_tool_calls(DecodeResult & r);
+
+// `first` continued by `more` (the thinking closed, the answer generated after it): the answer, tool calls and finish
+// reason of `more`, the token counts and timings of both
+inline void merge_continuation(DecodeResult & first, const DecodeResult & more) {
+    if (!more.error.empty()) {
+        first.error = more.error;
+        return;
+    }
+    first.text = more.text;
+    first.tool_calls = more.tool_calls;
+    first.completion_tokens += more.completion_tokens;
+    first.prefill_ms += more.prefill_ms;
+    first.decode_ms += more.decode_ms;
+    first.draft_n += more.draft_n;
+    first.draft_accepted += more.draft_accepted;
+    first.finish_reason = more.finish_reason;
+}
 
 // An answer that ended on its first token with nothing in it: the end-of-turn marker was sampled first. After a tool
 // result that leaves an agent client (pi) waiting for a turn that never came - seen in ~1 of 80 agent requests with
@@ -903,6 +971,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         model.spec_begin(prompt, count, draft_length(model.native_mtp()));
         pulse.generating();
         RepeatGuard guard;
+        if (req.thinking) guard.arm_thinking(think_end_id(tokenizer));
         while (model.spec_advance()) {
             const auto ids = model.spec_tokens(0);
             pulse.step(ids.size());
@@ -910,6 +979,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         }
         uint64_t st[5] = {};
         finish(tokenizer, req, model.spec_finish(st), result);
+        result.thinking_loop = guard.loop;
         result.cached_tokens = model.cached_prefix();
         set_timings(result, st);
         return result;
@@ -1354,6 +1424,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     model.spec_begin(prompt, count, draft_length(model.native_mtp()));
     pulse.generating();
     RepeatGuard guard;
+    if (req.thinking) guard.arm_thinking(think_end_id(tokenizer));
     uint64_t n_gen = 0;
     while (model.spec_advance()) {
         const auto ids = model.spec_tokens(0);
@@ -1363,6 +1434,7 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     }
     uint64_t st[5] = {};
     finish(tokenizer, req, model.spec_finish(st), result);
+    result.thinking_loop = guard.loop;
     result.cached_tokens = model.cached_prefix();
     set_timings(result, st);
     return result;

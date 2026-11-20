@@ -663,6 +663,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--api-key KEY` / `--api-key-file FILE` | | require a bearer key |
 | `--mmproj FILE [--image-min-tokens N] [--image-max-tokens N] [--mmproj-bits 16\|8\|4] [--image-cache-mb N]` | 8, 4096, 16, 512 | vision projector for image input; `--mmproj-bits` keeps its matrices as FP16, int8 or 4-bit (expanded per GEMM); `--image-cache-mb` keeps encoded images (host memory) so a conversation's earlier images are not encoded again. With `--prompt-cache on`, image prompts are reused up to the first image that differs |
 | `--repeat-limit N` | 256 | end a request after N identical tokens in a row (0 off) |
+| `--think-loop N` | 384 | close a looping thinking: once N thinking tokens repeat text already written twice (32-token spans), `</think>` is forced and the answer continues; a longer loop needs fewer copies (0 off) |
 | `--top-p F` | 0.95 | default nucleus over the scored candidates, for requests that omit `top_p` (1 = the whole set) |
 | `--top-k N` | 0 | default `top_k` for requests that omit it (0 = all candidates the model scores; see Sampling numbers) |
 
