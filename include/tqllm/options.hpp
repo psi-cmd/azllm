@@ -28,6 +28,9 @@ struct EngineOptions {
     int prompt_cache_probe = 128;  // --prompt-cache-probe N: a request of at most N prompt tokens that shares no prefix
                                    // with the cached conversation is a probe (health check, thinking-source probe, token
                                    // count) and is answered without evicting that conversation. 0: no probe leniency.
+    long cache_ram = 16384;  // --cache-ram MiB: with --prompt-cache, a conversation another one replaces on the slot is
+                             // kept in host memory (its KV up to its deepest resume point and its state snapshots),
+                             // least recently used out first, and copied back when its next request arrives. 0: off.
     bool kv_stage = true;  // --kv-stage on|off: with --kv-host, old positions move to host and are staged back per layer at
                            // link speed (one slot, compressed KV); off: the newest positions stay in host memory
     long kv_host = -1;  // --kv-host N: last N positions of each sequence's KV in host memory (read over PCIe); -1: the fit

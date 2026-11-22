@@ -720,6 +720,7 @@ public:
         }
         return 0;
     }
+
     size_t kv_pool_layers() const { return size_t(std::count(cfg.full.begin(), cfg.full.end(), true)); }
 
 private:
@@ -794,6 +795,180 @@ private:
             if (score < best_score) best_score = score, best = i;
         }
         return best;
+    }
+    // --cache-ram: conversations the slot gave up, kept in host memory until the budget evicts them (least recently
+    // used first). An entry is exactly what pc_match resumes from: the cache keys and the KV rows [0, n) of every
+    // attention layer (n: its deepest resume point), its recurrent-state snapshots with the conversation's end among
+    // them, and the drafter's K/V rows (those steer the drafts only: stale ones would cost acceptance, never tokens).
+    // A request whose prompt an entry serves deeper than the live conversation swaps it back in before pc_match, which
+    // then resumes from its snapshots as it would have had the conversation never left. One slot, flat device KV only.
+    static constexpr uint32_t kStashMin = 1024;  // shorter conversations re-prefill faster than the bookkeeping is worth
+    struct Stash {
+        std::vector<uint32_t> seq;          // cache keys [0, n)
+        std::vector<PcCk> cks;              // resume points, ascending, all <= n
+        std::unique_ptr<uint8_t[]> kv;      // per attention layer: K rows [0, n), then V rows [0, n)
+        std::unique_ptr<uint8_t[]> dkv;     // per drafter layer: K rows, then V rows (the ring, or [0, n))
+        size_t bytes = 0;
+        uint64_t used = 0;
+    };
+    std::vector<Stash> stash;
+    size_t stash_bytes = 0;
+    uint64_t stash_clock = 0;
+    size_t stash_budget() const { return opt.cache_ram > 0 ? size_t(opt.cache_ram) << 20 : 0; }
+    size_t ck_bytes() const { return (conv_bytes() + rec_bytes()) * (conv_state.size() / NSLOT); }
+    size_t dfl_rows(uint32_t n) const { return dfl_kc.empty() ? 0 : (dfl.ring ? size_t(dfl.ring) : size_t(n)); }
+    size_t dfl_row_bytes() const { return size_t(dfl.kvheads) * size_t(dfl.hd) * 2; }
+    std::unique_ptr<HostBuf> ck_buf() {
+        if (!pc_pool.empty()) { auto b = std::move(pc_pool.back()); pc_pool.pop_back(); return b; }
+        return std::make_unique<HostBuf>(ck_bytes());
+    }
+    // the deepest resume point `cks` offers a prompt that shares `shared` keys with their conversation (pc_best)
+    static uint32_t ck_resume(const std::vector<PcCk> & cks, uint32_t shared, uint32_t P) {
+        uint32_t best = 0;
+        for (const auto & c : cks) if (c.pos <= shared && c.pos < P && c.pos > best) best = c.pos;
+        return best;
+    }
+    // Copies the live conversation into the stash. `shared`: what the incoming prompt shares with it - snapshots past
+    // that point are about to be discarded (the request's prompt does not have their tokens), so they move instead.
+    void stash_save(uint32_t shared) {
+        flush_pending();
+        if (pend_k) set_pending(0);
+        uint32_t n = pc_snap;
+        for (const auto & c : pc_cks) n = std::max(n, c.pos);
+        if (pc_live) n = uint32_t(pc_seq.size());
+        n = std::min<uint32_t>(n, uint32_t(pc_seq.size()));
+        if (n < kStashMin) return;
+        size_t nck = (pc_snap && pc_snap <= n) + (pc_live ? 1 : 0);
+        for (const auto & c : pc_cks) nck += c.pos <= n;
+        const size_t kr = size_t(kv_row_bytes(true)), vr = size_t(kv_row_bytes(false)), L = key_cache.size();
+        const size_t dr = dfl_rows(n), drb = dfl_row_bytes();
+        const size_t kv_b = L * size_t(n) * (kr + vr), dkv_b = dfl_kc.size() * 2 * dr * drb;
+        const size_t bytes = kv_b + dkv_b + nck * ck_bytes();
+        if (bytes > stash_budget()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        Stash s;
+        try {
+            s.kv.reset(new uint8_t[kv_b]);
+            if (dkv_b) s.dkv.reset(new uint8_t[dkv_b]);
+        } catch (const std::bad_alloc &) {
+            std::fprintf(stderr, "tqllm: cache-ram: no host memory for %.0f MiB; conversation not kept\n", bytes / 1048576.0);
+            return;
+        }
+        // an entry that is a prefix of this conversation (stashed on an earlier switch) offers nothing this one does not
+        for (size_t i = stash.size(); i-- > 0;)
+            if (stash[i].seq.size() <= n && common_prefix(stash[i].seq, pc_seq) == stash[i].seq.size()) {
+                stash_bytes -= stash[i].bytes;
+                stash.erase(stash.begin() + std::ptrdiff_t(i));
+            }
+        while (!stash.empty() && stash_bytes + bytes > stash_budget()) {
+            const auto lru = std::min_element(stash.begin(), stash.end(), [](const Stash & a, const Stash & b) { return a.used < b.used; });
+            std::fprintf(stderr, "tqllm: cache-ram: evicted a conversation of %zu tokens (%.0f MiB)\n", lru->seq.size(), lru->bytes / 1048576.0);
+            stash_bytes -= lru->bytes;
+            stash.erase(lru);
+        }
+        s.seq.assign(pc_seq.begin(), pc_seq.begin() + n);
+        uint8_t * h = s.kv.get();
+        for (size_t a = 0; a < L; ++a) {
+            ck(cudaMemcpyAsync(h, key_cache[a].p, size_t(n) * kr, cudaMemcpyDeviceToHost, stream)), h += size_t(n) * kr;
+            ck(cudaMemcpyAsync(h, value_cache[a].p, size_t(n) * vr, cudaMemcpyDeviceToHost, stream)), h += size_t(n) * vr;
+        }
+        if (dkv_b) {
+            h = s.dkv.get();
+            for (size_t l = 0; l < dfl_kc.size(); ++l) {
+                ck(cudaMemcpyAsync(h, dfl_kc[l].p, dr * drb, cudaMemcpyDeviceToHost, stream)), h += dr * drb;
+                ck(cudaMemcpyAsync(h, dfl_vc[l].p, dr * drb, cudaMemcpyDeviceToHost, stream)), h += dr * drb;
+            }
+        }
+        size_t w = 0;
+        for (size_t i = 0; i < pc_cks.size(); ++i) {
+            auto & c = pc_cks[i];
+            if (c.pos > n) { pc_cks[w++] = std::move(c); continue; }
+            PcCk e;
+            e.pos = c.pos, e.turn_end = c.turn_end;
+            if (c.pos > shared) e.buf = std::move(c.buf);  // the request drops it anyway
+            else {
+                e.buf = ck_buf();
+                std::memcpy(e.buf->p, c.buf->p, ck_bytes());
+                pc_cks[w++] = std::move(c);
+            }
+            s.cks.push_back(std::move(e));
+        }
+        pc_cks.resize(w);
+        if (pc_snap && pc_snap <= n && pc_host) {
+            PcCk e;
+            e.pos = pc_snap, e.buf = ck_buf();
+            std::memcpy(e.buf->p, pc_host->p, ck_bytes());
+            s.cks.push_back(std::move(e));
+        }
+        if (pc_live) {  // the state at the conversation's end: its next turn resumes exactly there
+            PcCk e;
+            e.pos = n, e.buf = ck_buf();
+            pc_copy(true, e.buf->p);
+            s.cks.push_back(std::move(e));
+        }
+        sync_ck();
+        std::sort(s.cks.begin(), s.cks.end(), [](const PcCk & a, const PcCk & b) { return a.pos < b.pos; });
+        s.bytes = bytes;
+        s.used = ++stash_clock;
+        stash_bytes += bytes;
+        stash.push_back(std::move(s));
+        std::fprintf(stderr, "tqllm: cache-ram: kept a conversation of %u tokens, %zu snapshots (%.0f MiB, %.0f ms); %zu kept, %.0f of %.0f MiB\n",
+                     n, nck, bytes / 1048576.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                     stash.size(), stash_bytes / 1048576.0, stash_budget() / 1048576.0);
+    }
+    // Makes stash entry i the live conversation (the slot's own one must have been saved or given up first).
+    void stash_restore(size_t i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        Stash s = std::move(stash[i]);
+        stash.erase(stash.begin() + std::ptrdiff_t(i));
+        stash_bytes -= s.bytes;
+        if (pend_k) set_pending(0);
+        const uint32_t n = uint32_t(s.seq.size());
+        const size_t kr = size_t(kv_row_bytes(true)), vr = size_t(kv_row_bytes(false)), L = key_cache.size();
+        const uint8_t * h = s.kv.get();
+        for (size_t a = 0; a < L; ++a) {
+            ck(cudaMemcpyAsync(key_cache[a].p, h, size_t(n) * kr, cudaMemcpyHostToDevice, stream)), h += size_t(n) * kr;
+            ck(cudaMemcpyAsync(value_cache[a].p, h, size_t(n) * vr, cudaMemcpyHostToDevice, stream)), h += size_t(n) * vr;
+        }
+        if (s.dkv) {
+            const size_t dr = dfl_rows(n), drb = dfl_row_bytes();
+            h = s.dkv.get();
+            for (size_t l = 0; l < dfl_kc.size(); ++l) {
+                ck(cudaMemcpyAsync(dfl_kc[l].p, h, dr * drb, cudaMemcpyHostToDevice, stream)), h += dr * drb;
+                ck(cudaMemcpyAsync(dfl_vc[l].p, h, dr * drb, cudaMemcpyHostToDevice, stream)), h += dr * drb;
+            }
+        }
+        sync_ck();
+        for (auto & c : pc_cks) if (pc_pool.size() < size_t(pc_keep)) pc_pool.push_back(std::move(c.buf));
+        pc_cks = std::move(s.cks);
+        while (pc_cks.size() > size_t(pc_keep)) pc_cks.erase(pc_cks.begin() + std::ptrdiff_t(pc_victim(pc_cks, n)));
+        pc_seq = std::move(s.seq);
+        pc_snap = 0, pc_live = false, pc_next = 0;
+        std::fprintf(stderr, "tqllm: cache-ram: restored a conversation of %u tokens (%.0f ms); %zu kept, %.0f MiB\n", n,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), stash.size(),
+                     stash_bytes / 1048576.0);
+    }
+    // Before pc_match: swap in the stashed conversation that serves `key` deepest, keeping the live one; or, when the
+    // request is about to overwrite the live conversation, keep a copy of it first.
+    void stash_switch(const std::vector<uint32_t> & key) {
+        if (!stash_budget() || nslots != 1 || kv_cmp || kv_staged) return;
+        const uint32_t P = uint32_t(key.size());
+        const uint32_t shared = pc_seq.empty() ? 0 : common_prefix(pc_seq, key);
+        if (!pc_seq.empty() && shared == 0 && pc_probe && P <= pc_probe) return;  // a probe leaves the conversation alone
+        uint32_t live = (pc_live && shared == pc_seq.size() && shared < P) ? shared : ck_resume(pc_cks, shared, P);
+        if (pc_snap && pc_snap <= shared && pc_snap < P) live = std::max(live, pc_snap);
+        size_t best = stash.size();
+        uint32_t deepest = 0;
+        for (size_t i = 0; i < stash.size(); ++i) {
+            const uint32_t r = ck_resume(stash[i].cks, common_prefix(stash[i].seq, key), P);
+            if (r > deepest) deepest = r, best = i;
+        }
+        const bool swap = best < stash.size() && deepest >= live + kStashMin;
+        if (swap || pc_seq.size() >= size_t(shared) + kStashMin) stash_save(shared);
+        if (swap) {
+            for (size_t i = 0; i < stash.size(); ++i)  // stash_save may have reordered or evicted: find it again
+                if (ck_resume(stash[i].cks, common_prefix(stash[i].seq, key), P) == deepest) { stash_restore(i); return; }
+        }
     }
     // <|im_start|> of the generation prompt: the state just before it is a message boundary any rewritten history that
     // keeps the messages so far (a compaction summary, a branch) shares exactly; UINT32_MAX when the vocab has none
@@ -3888,6 +4063,8 @@ public:
             }
         }
         const std::vector<uint32_t> & key = images.empty() ? prompt : key_buf;
+        // --cache-ram: a stashed conversation this prompt continues comes back first; one it replaces is kept
+        if (pc_on && keyed) stash_switch(key);
         // prompt reuse: positions [0, P0) are already cached; a boundary at snap keeps the state for the next request
         const uint32_t P0 = pc_on && keyed ? pc_match(key) : 0;
         last_pc = P0;

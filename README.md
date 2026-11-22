@@ -701,6 +701,7 @@ Docker variables: `MODEL_FILE`, `TOKENIZER_FILE`, `DRAFT_MODEL_FILE`, `DRAFT_VOC
 | `--prompt-cache on\|off` | off | keep the previous turn's KV so a follow-up does not re-read the document (one slot; on with `--kv-compact`) |
 | `--prompt-cache-step N` | auto | with `--prompt-cache`: bookmark the state every N prompt tokens so a prompt that differs mid-history resumes from the nearest bookmark instead of reading everything again (§7). Auto is 2048, widened to `ceil(P/16)` so the bookmarks span the prompt; `0` turns bookmarking off |
 | `--prompt-cache-probe N` | 128 | with `--prompt-cache`: a request of at most N prompt tokens that shares no prefix with the cached conversation is treated as a probe - a health check, a thinking-source probe, a token count - and is answered without evicting that conversation; `0` turns this off (§7) |
+| `--cache-ram MiB` | 16384 | with `--prompt-cache`, one slot, KV on the GPU: a conversation that another one replaces on the slot is kept in host memory - its KV up to its deepest resume point plus its state snapshots, about 13.5 KiB per token (q4/tcq2) + 146 MiB per snapshot on Qwen3.8-27B - and copied back when a request continues it, least recently used out first; `0` turns this off |
 | `--kv-store flat` | flat | KV storage policy (only flat is served today) |
 | `--rope-scaling none\|linear\|yarn --rope-scale F [--yarn-orig-ctx N]` | none | context past the trained length (llama.cpp names) |
 
