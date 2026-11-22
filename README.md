@@ -41,6 +41,16 @@ Everything from the next heading on is the upstream README. Numbers are RTX 4090
 - Image prompts reuse the prompt cache, keyed by image digest. `--image-cache-mb` keeps encoded images.
 - `/v1/models` and `/props` announce image input when `--mmproj` is loaded.
 
+**TQ_L conversion (FP16 / BF16 checkpoint -> azllm GGUF)**
+- `tools/convert_qwen35_tq4_gptq.py` and `tools/tq4_gptq.py` convert Qwen3.5 / Qwen3.8 dense HF weights to a TQ_L-layout
+  GGUF, quantising the body to TQ4 with GPTQ on calibration text. The tensor types follow `tools/tq_l_recipe.json`
+  (the 866 entries of the official TQ_L header). The converter resumes layer by layer, and it evaluates the result
+  (KL and top-1 agreement against the original) before assembling the GGUF. `tools/convert_qwen35_tq4_rtn.py` is the
+  round-to-nearest baseline.
+- `docs/TQ4_GPTQ_RECIPE.md` is the recipe. It covers the inputs, the `--fp-check` sanity run, the exact command that
+  produced the Qwen3.8-27B Uncensored TQ_L-GPTQ model served here (about 1 h 40 min on the 4090) and recalibration on
+  your own text. The WikiText-2 calibration files are not in the repository; the doc gives the download.
+
 **Build and tooling**
 - CUDA 13.1 / new glibc compatibility header (`.toolchain/cuda_glibc_compat.h`).
 - `bench/fastloop.sh` checks one prompt exactly and reports its speed. `bench/kprof.sh` is a CUPTI per-kernel tracer
