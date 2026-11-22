@@ -1,3 +1,43 @@
+## Branch `feat/bw-compat`: Hygon BW port and DFlash2 drafter training
+
+This branch is `main` plus the work that only matters on a Hygon BW card (BW1000, gfx936, DTK) or for training a
+DFlash2 drafter. The NVIDIA build is unchanged unless `-DTQLLM_BW=ON` is given. Everything below the next `---` is the
+`main` README.
+
+**BW / GPUFusion backend**
+- `-DTQLLM_BW=ON [-DTQLLM_BW_ARCH=gfx936]` builds with DTK's nvcc and `--offload-arch`. The NVIDIA-only inline PTX
+  (`mma.sync` and friends) gets real BW implementations in `kernels/bw_primitives.cuh` and `kernels/bw_dumma.cuh`
+  (wave64 DUMMA), used by the attention, TQ4, TQ3-KV and quant kernels.
+- `-DTQLLM_BW_EMULATE=ON` emulates those primitives on CUDA, so they can be checked numerically on an NVIDIA card
+  (`tests/bw_primitives.cu`).
+- Opt-in matrix-chunk GDN prefill for gfx936 (`kernels/gdn_chunk_bw.cuh`, enabled by `TQLLM_GDN_CHUNK_MIN`).
+  Decode and speculative trees keep the original kernel. It is covered by `tests/gdn_bw_chunk.cu` and
+  `tools/dflash2_train/compare_gdn_features.py`.
+- Requirements, port boundaries and the cross-compile findings are in `docs/BW_GPUFUSION_PORT_REQUIREMENTS.md`.
+  On BW1000 the full loop ran: dump features, train a 5-layer drafter, export the GGUF, then a lossless
+  `tqgolden -md` check.
+
+**DFlash2 drafter training on the quantized target** (`tools/dflash2_train/`, see its README)
+- `tools/tqfeatures.cpp` is a feature server: it takes token ids and returns the drafter layers' hidden states from
+  the quantized target GGUF in framed `TQF1` output. Its output is bit-identical to `tqgolden`. Reads are pipelined
+  into reused buffers.
+- `train.py` trains the unmodified NeMo Automodel DFlash2 modules, using `features.py` (server pool and on-disk cache)
+  and `gguf_target.py` (frozen embedding and head from the GGUF). `export_gguf.py` writes a drafter GGUF for `-md`.
+- RoPE theta is read from the drafter config's `rope_parameters`, and training refuses to start unless it is 1e7.
+  transformers 4.x silently used 10000, which made the first fine-tune serve 7-10% worse.
+- `TQLLM_DFLASH_DUMP=DIR` dumps the engine's first draft, and `compare_drafter.py` checks it layer by layer against
+  the reference drafter. The engine's drafts matched the reference exactly.
+- Outcome so far: fine-tuning the official drafter on about 5M on-policy tokens left acceptance flat (< 1%). The
+  sampling-time gap was fixed on `main` instead, by sampled drafts and sampled tree verify.
+
+**TQ_L conversion**
+- `tools/convert_qwen35_tq4_gptq.py`, `tools/tq4_gptq.py` and `tools/convert_qwen35_tq4_rtn.py` convert Qwen3.5 /
+  Qwen3.8 dense weights to a TQ4 GGUF with GPTQ (or RTN), following `tools/tq_l_recipe.json`. That recipe lists the
+  866 tensor types of the official TQ_L file. The method and the comparison with the official file are in
+  `docs/TQ4_GPTQ_RECIPE.md`.
+
+---
+
 ## psi-cmd/azllm: changes on top of upstream
 
 This branch is [xhinker/azllm](https://github.com/xhinker/azllm) (up to `65430de`) plus the commits below, authored here
