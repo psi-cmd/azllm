@@ -130,6 +130,11 @@ inline uint32_t think_end_id(const tqllm::Tokenizer & tokenizer) {
     return ids.size() == 1 ? ids[0] : UINT32_MAX;
 }
 
+inline uint32_t tool_call_id(const tqllm::Tokenizer & tokenizer) {
+    static const auto ids = tokenizer.encode("<tool_call>");
+    return ids.size() == 1 ? ids[0] : UINT32_MAX;
+}
+
 inline std::string trim(const std::string & x) {
     const auto a = x.find_first_not_of(" \t\r\n");
     if (a == std::string::npos) return "";
@@ -149,6 +154,9 @@ struct ChatRequest {
     uint32_t max_tokens = 64;
     bool chat = true;
     bool tools = false;  // tool schemas were rendered: parse <tool_call> blocks in the output
+    // tool_choice "none": the tools are still rendered (the prompt, and so the cached prefix, stays the conversation's),
+    // but the answer ends where the model opens a <tool_call> - pi-cache-compact's summary request relies on this
+    bool no_tool_calls = false;
     bool thinking = false;  // prompt opens a <think> block: split the output into reasoning_content / content
     // reasoning budget, llama.cpp semantics: -1 unlimited, 0 end thinking immediately, N > 0 at most N thinking tokens, then the
     // message + end-of-thinking tag are forced and the answer continues. budget_set / message_set: the request named them
@@ -167,6 +175,20 @@ struct ChatRequest {
     bool ok = false;
     std::string error;
 };
+
+// tool_choice "none": `tok` opens a tool call, so the answer ends before it (finish() treats it like end-of-sequence)
+inline bool opens_tool_call(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, uint32_t tok) {
+    return req.no_tool_calls && tok == tool_call_id(tokenizer);
+}
+
+// the generation loops: ids[from..] (what the last step added) open a tool call -> stop generating
+inline bool opens_tool_call(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, const std::vector<uint32_t> & ids,
+                            size_t from) {
+    if (!req.no_tool_calls) return false;
+    for (size_t i = std::min(from, ids.size()); i < ids.size(); ++i)
+        if (ids[i] == tool_call_id(tokenizer)) return true;
+    return false;
+}
 
 inline bool read_token_count(const tqllm::Json * value, uint32_t & out) {
     if (!value || value->kind != tqllm::Json::Number || !std::isfinite(value->num) || value->num < 0 ||
@@ -283,6 +305,9 @@ inline ChatRequest parse_request(const std::string & body, uint32_t default_max_
                 return req;
             }
         }
+
+        if (const auto * tc = root.get("tool_choice"); tc && tc->kind == tqllm::Json::String && tc->str == "none")
+            req.no_tool_calls = true;
 
         if (chat_endpoint) {
             const auto * messages = root.get("messages");
@@ -926,7 +951,7 @@ inline void finish(const tqllm::Tokenizer & tokenizer, const ChatRequest & req, 
         result.finish_reason = "length";
         for (const uint32_t tok : gen) {
             ++result.completion_tokens;
-            if (tok == tokenizer.eos_id()) {
+            if (tok == tokenizer.eos_id() || opens_tool_call(tokenizer, req, tok)) {
                 result.finish_reason = "stop";
                 break;
             }
@@ -973,10 +998,12 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
         pulse.generating();
         RepeatGuard guard;
         if (req.thinking) guard.arm_thinking(think_end_id(tokenizer));
+        size_t seen = 0;
         while (model.spec_advance()) {
             const auto ids = model.spec_tokens(0);
             pulse.step(ids.size());
-            if (guard.check(ids)) break;
+            if (guard.check(ids) || opens_tool_call(tokenizer, req, ids, seen)) break;
+            seen = ids.size();
         }
         uint64_t st[5] = {};
         finish(tokenizer, req, model.spec_finish(st), result);
@@ -1003,7 +1030,7 @@ inline DecodeResult decode(const tqllm::Tokenizer & tokenizer, tqllm::Model & mo
     RepeatGuard guard;
     for (uint32_t i = 0; i < count; ++i) {
         ++result.completion_tokens;
-        if (next == tokenizer.eos_id()) {
+        if (next == tokenizer.eos_id() || opens_tool_call(tokenizer, req, next)) {
             result.finish_reason = "stop";
             break;
         }
@@ -1429,9 +1456,10 @@ inline DecodeResult decode_stream(const tqllm::Tokenizer & tokenizer, tqllm::Mod
     uint64_t n_gen = 0;
     while (model.spec_advance()) {
         const auto ids = model.spec_tokens(0);
+        const size_t seen = n_gen;
         n_gen = ids.size();  // spec_tokens returns the whole sequence, not the step delta
         pulse.step(n_gen);
-        if (guard.check(ids) || !on_tokens(ids)) break;
+        if (guard.check(ids) || !on_tokens(ids) || opens_tool_call(tokenizer, req, ids, seen)) break;
     }
     uint64_t st[5] = {};
     finish(tokenizer, req, model.spec_finish(st), result);

@@ -124,9 +124,11 @@ private:
     // after a step: the slot's ids go to the stream and through the repeat guard (tripped -> the request ends)
     bool step_done(Job & job, int slot) {
         const auto ids = model_.spec_tokens(slot);
+        const size_t seen = job.n_gen;
         job.n_gen = ids.size();  // spec_tokens returns the whole sequence, not the step delta
         job.pulse.step(job.n_gen);
-        const bool tripped = job.repeat.check(ids);
+        // tool_choice "none" and the step opened a tool call: end the request (finish() cuts the answer before it)
+        const bool tripped = job.repeat.check(ids) || opens_tool_call(tokenizer_, job.req, ids, seen);
         if (job.stream) publish(job, ids);
         return tripped;
     }

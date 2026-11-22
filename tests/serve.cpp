@@ -142,6 +142,20 @@ void test_default_max_tokens() {
     check(big.ok && big.max_tokens == 8192, "max_tokens capped at the server default");
 }
 
+void test_tool_choice_none() {
+    const std::string tools = R"("tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}])";
+    const auto none = tqserve::parse_request(
+        R"({"messages":[{"role":"user","content":"Hi"}],"tool_choice":"none",)" + tools + "}", 512, "", true);
+    check(none.ok && none.no_tool_calls && none.tools, "tool_choice none: tools still rendered, calls not allowed");
+    check(none.prompt_text.find("<tools>") != std::string::npos, "tool_choice none keeps the tool block in the prompt");
+    const auto with = tqserve::parse_request(R"({"messages":[{"role":"user","content":"Hi"}],)" + tools + "}", 512, "", true);
+    check(with.ok && !with.no_tool_calls && with.prompt_text == none.prompt_text,
+          "tool_choice none renders the same prompt (the cached prefix still matches)");
+    const auto aut = tqserve::parse_request(
+        R"({"messages":[{"role":"user","content":"Hi"}],"tool_choice":"auto",)" + tools + "}", 512, "", true);
+    check(aut.ok && !aut.no_tool_calls, "tool_choice auto allows calls");
+}
+
 void test_tool_stream_limit() {
     using tqserve::tool_stream_limit;
     check(tool_stream_limit("Plain answer.") == 13, "tools: prose without markup streams whole");
@@ -492,6 +506,7 @@ int main(int argc, char ** argv) {
     test_reader();
     test_chat_prompt();
     test_default_max_tokens();
+    test_tool_choice_none();
     test_tool_stream_limit();
     (void) argc; (void) argv;
     test_jinja_images();
