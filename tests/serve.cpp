@@ -482,6 +482,7 @@ void test_modalities() {
 
 int main(int argc, char ** argv) {
     tqserve::serve_options().repeat_limit = 6;
+    tqserve::serve_options().think_loop = 384;  // off by default; the guard tests run at the suggested value
     test_image_cache();
     test_modalities();
     test_thinking_loop_guard();

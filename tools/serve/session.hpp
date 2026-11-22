@@ -33,7 +33,8 @@ namespace tqserve {
 struct ServeOptions {
     int draft_max = 0;            // --draft-max N: drafts per step (1..15); 0: the drafter's default (DFlash2 7, DSpark 3)
     uint32_t repeat_limit = 256;  // --repeat-limit N: one token N times in a row ends the request (0 = off)
-    uint32_t think_loop = 384;    // --think-loop N: N thinking tokens repeating text written twice before close it (0 = off)
+    uint32_t think_loop = 0;      // --think-loop N: N thinking tokens repeating text written twice before close it (0 = off;
+                                  // off by default: the client (a pi extension) owns loop handling, see README)
     float top_p = 0.95f;        // --top-p F: nucleus over the scored candidates, the Qwen3.8 card value for both
                                 // modes; 1.0 = the old behaviour (sample the whole candidate set)
     int top_k = 0;              // --top-k N: 0 = all candidates the model scores (16); above 16 has no effect
