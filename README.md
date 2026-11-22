@@ -1,3 +1,53 @@
+## psi-cmd/azllm: changes on top of upstream
+
+This branch is [xhinker/azllm](https://github.com/xhinker/azllm) (up to `65430de`) plus the commits below, authored here
+to run Qwen3.8-27B (TQ_L-GPTQ + DFlash2, `--np 1 --kv q4/tcq2 --prompt-cache on`) on one RTX 4090 behind pi / pi-web.
+Everything from the next heading on is the upstream README. Numbers are RTX 4090 measurements from the commit messages.
+
+**Speculative decoding (exact: greedy output unchanged, sampled output still an exact sample of the target)**
+- DFlash2 drafts at temperature > 0 are drawn from the selector's distribution and verified by rejection sampling
+  (accept length 3.95 -> 4.48, 187 -> 212 tok/s). `TQLLM_DFLASH_SAMPLE=0` restores greedy drafts.
+- Verify trees of up to 16 columns, so `--draft-max 15` builds a 15-node tree. Tree attention is cheaper, and deferred
+  commit is enabled on sm_89 (GSM8K 250 -> 271 tok/s at 15 nodes).
+- Sampled requests verify the token tree too (SpecInfer-style multi-step sampling): accept length 4.43 -> 5.13,
+  214.9 -> 227.5 tok/s.
+- `--temp F` sets the default temperature for requests that send none (pi never does).
+
+**Prompt cache for agent loops**
+- Per-slot prompt cache with cache-affinity routing.
+- Snapshots are kept spread across the context and at message boundaries. A rewritten history (a compaction summary)
+  then resumes near its divergence instead of re-reading 222K tokens.
+- Cache hits are reported in `usage.prompt_tokens_details.cached_tokens`, and in the Responses and Anthropic
+  equivalents.
+- `--cache-ram MiB` (default 16384): with one slot, a conversation that another one replaces is kept in host memory.
+  This covers its KV, its drafter KV and its state snapshots, and the oldest goes out first. It is copied back when its
+  next request arrives: an 18K-token conversation takes 2.3 GB and returns in 27 ms with an identical answer.
+
+**OpenAI-compatible serving fixes**
+- Each tool call and each response gets a unique id. Before, every answer reused `call_0` and clients merged calls.
+- Tool-call arguments stream as they are generated instead of arriving at the end.
+- `tool_choice: "none"` is honoured. The tools stay in the prompt, so the cached prefix still matches, but generation
+  stops where the model opens a tool call. pi-cache-compact needs this to get its summary.
+- An answer whose first sampled token ends the turn is sampled again, up to twice. In pi such an empty turn stalls the
+  agent.
+- The sampled first token is read from the final prefill chunk's last position. A short final chunk had made answers
+  start with a role name.
+- `--think-loop N` closes a looping thinking and continues the answer. It is off by default; 384 is the replay-tested
+  value.
+
+**Vision**
+- BF16 / quantised mmproj loading. `--mmproj-bits 16|8|4` keeps encoder matrices in 8 or 4 bits
+  (874 -> 539 MiB at 8 bits, cosine >= 0.994). `tools/convert_mmproj.py` converts an HF checkpoint.
+- Image prompts reuse the prompt cache, keyed by image digest. `--image-cache-mb` keeps encoded images.
+- `/v1/models` and `/props` announce image input when `--mmproj` is loaded.
+
+**Build and tooling**
+- CUDA 13.1 / new glibc compatibility header (`.toolchain/cuda_glibc_compat.h`).
+- `bench/fastloop.sh` checks one prompt exactly and reports its speed. `bench/kprof.sh` is a CUPTI per-kernel tracer
+  that works inside CUDA graphs. `matvec-sweep` times TQ3 / TQ4 matvec variants.
+
+---
+
 ## azllm: why this fork
 
 azllm is a fork of [tqllm](https://github.com/turbo-tan/tqllm) set up to run Qwen3.8-27B as a daily driver for coding
