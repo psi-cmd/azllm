@@ -30,12 +30,6 @@ DFlash2 drafter. The NVIDIA build is unchanged unless `-DTQLLM_BW=ON` is given. 
 - Outcome so far: fine-tuning the official drafter on about 5M on-policy tokens left acceptance flat (< 1%). The
   sampling-time gap was fixed on `main` instead, by sampled drafts and sampled tree verify.
 
-**TQ_L conversion**
-- `tools/convert_qwen35_tq4_gptq.py`, `tools/tq4_gptq.py` and `tools/convert_qwen35_tq4_rtn.py` convert Qwen3.5 /
-  Qwen3.8 dense weights to a TQ4 GGUF with GPTQ (or RTN), following `tools/tq_l_recipe.json`. That recipe lists the
-  866 tensor types of the official TQ_L file. The method and the comparison with the official file are in
-  `docs/TQ4_GPTQ_RECIPE.md`.
-
 ---
 
 ## psi-cmd/azllm: changes on top of upstream
